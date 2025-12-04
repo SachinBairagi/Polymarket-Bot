@@ -417,11 +417,14 @@ def analyse_market_object(chat_id: int, market: Dict[str, Any]) -> None:
     total_market = sum(prices)
     total_ai = sum(ai_probs)
 
-    lines: List[str] = []
-    lines.append(f"*Question:*\n{question}\n")
-    lines.append(f"`{SECTION_DIVIDER}`")
-    lines.append(f"*Stake for examples:* `{INVEST_AMOUNT_USDC:.2f}` USDC\n")
-    lines.append("*Outcome | Market % | AI % | Edge | Sentiment*")
+   lines: List[str] = []
+
+lines.append("🧠 **Market Analysis**")
+lines.append(f"**Question:**\n{question}\n")
+lines.append(f"{SECTION_DIVIDER}\n")
+lines.append(f"📌 **Stake Used for Examples:** `{INVEST_AMOUNT_USDC:.2f}` USDC\n")
+lines.append("➡️ **Outcome Comparison (Market vs AI)**\n")
+
 
     for i, price in enumerate(prices):
         name = outcomes[i] if i < len(outcomes) else f"Outcome {i}"
@@ -453,14 +456,27 @@ def analyse_market_object(chat_id: int, market: Dict[str, Any]) -> None:
             f"(edge: {edge:+.2f}%)  {sent_label}"
         )
 
-        sig_line = trading_signal(price, ai_probs[i])
-        lines.append(f"  ↳ {sig_line}")
+       sig_line = trading_signal(price, ai_probs[i])
+lines.append(f"  ↳ {sig_line}")
 
-        rec = recommendation_text(price, ai_probs[i])
-        lines.append(f"  ↳ {rec}")
+# Trading signal block (NEW)
+ts = generate_trading_signal(price, ai_probs[i])
 
-        lines.append("  ↳ " + profit_scenario_text(price))
-        lines.append("")
+lines.append(
+    f"  ↳ 🎯 *Trading Signal*: {ts['signal']}\n"
+    f"     Confidence: {ts['confidence']}\n"
+    f"     Risk: {ts['risk']}\n"
+    f"     Entry: {ts['entry_low']:.2f} – {ts['entry_high']:.2f}\n"
+    f"     TP1: {ts['tp1']:.2f} | TP2: {ts['tp2']:.2f}\n"
+    f"     SL: {ts['sl']:.2f}"
+)
+
+rec = recommendation_text(price, ai_probs[i])
+lines.append(f"  ↳ {rec}")
+
+lines.append("  ↳ " + profit_scenario_text(price))
+lines.append("")
+
 
     lines.append(f"Market prob sum: `{total_market:.3f}`")
     lines.append(f"AI prob sum: `{total_ai:.3f}`\n")
@@ -739,6 +755,253 @@ def alert_loop() -> None:
             print("[ALERT LOOP ERROR]", e)
 
         time.sleep(ALERT_CHECK_INTERVAL_SEC)
+# =========================
+# REAL-TIME WHALE MONITOR (NEW)
+# =========================
+
+def whale_monitor_loop():
+    seen_trade_ids = set()
+
+    while True:
+        try:
+            url = "https://data-api.polymarket.com/trades?limit=200"
+            resp = requests.get(url, timeout=10)
+            trades = resp.json()
+
+            for t in trades:
+                tid = t.get("id")
+                if tid in seen_trade_ids:
+                    continue
+                seen_trade_ids.add(tid)
+
+                size = float(t.get("size") or 0)
+                price = float(t.get("price") or 0)
+                notional = size * price
+                if notional < MIN_WHALE_USDC:
+                    continue
+
+                wallet = t.get("maker") or "unknown"
+                side = t.get("side", "UNKNOWN")
+                outcome = t.get("outcome") or ""
+                market_id = t.get("market") or ""
+                ts = t.get("createdAt") or ""
+
+                msg = (
+                    "🐋 *WHALE TRADE ALERT*\n"
+                    f"- Wallet: `{wallet}`\n"
+                    f"- Side: *{side}*\n"
+                    f"- Outcome: `{outcome}`\n"
+                    f"- Size: `{size}` shares @ {price:.3f}\n"
+                    f"- Notional: `{notional:.0f}` USDC\n"
+                    f"- Market ID: `{market_id}`\n"
+                    f"- Time: `{ts}`\n\n"
+                    "_Big trader detected on Polymarket._"
+                )
+
+                for chat_id in WATCHLIST.keys():
+                    send_message(chat_id, msg)
+
+        except Exception as e:
+            print("[WHALE MONITOR ERROR]", e)
+
+        time.sleep(10)
+
+# =========================
+# PRICE MOVEMENT MONITOR (NEW)
+# =========================
+
+PRICE_HISTORY = {}
+
+def price_movement_loop():
+    """
+    Checks average market price over time and alerts if big change happens.
+    """
+    while True:
+        try:
+            # Loop through every watched market
+            for chat_id, markets in WATCHLIST.items():
+                for slug in markets.keys():
+
+                    # Fetch market
+                    try:
+                        m = fetch_market_by_slug(slug)
+                    except:
+                        continue
+
+                    prices = parse_outcome_prices(m)
+                    if not prices:
+                        continue
+
+                    avg_price = sum(prices) / len(prices)
+
+                    # Store price history
+                    if slug not in PRICE_HISTORY:
+                        PRICE_HISTORY[slug] = []
+
+                    PRICE_HISTORY[slug].append(avg_price)
+
+                    # Limit history to last 30 data points
+                    PRICE_HISTORY[slug] = PRICE_HISTORY[slug][-30:]
+
+                    # Check movement only if we have enough data
+                    if len(PRICE_HISTORY[slug]) > 5:
+                        old = PRICE_HISTORY[slug][0]
+                        movement = (avg_price - old) / old
+
+                        if abs(movement) >= 0.05:  # 5% movement
+                            msg = (
+                                "⚡ *Price Movement Alert*\n"
+                                f"Market: `{slug}`\n"
+                                f"Movement: `{movement * 100:.2f}%` in last minutes\n"
+                                "_Significant price action detected._"
+                            )
+                            send_message(chat_id, msg)
+
+        except Exception as e:
+            print("[PRICE MOVEMENT ERROR]", e)
+
+        time.sleep(20)  # Check every 20 seconds
+
+
+# =========================
+# DAILY PREDICTION SUMMARY (NEW)
+# =========================
+
+def build_daily_summary():
+    """
+    Generates a daily AI prediction summary based on watched markets.
+    """
+    if not WATCHLIST:
+        return "No watched markets today."
+
+    lines = ["📊 *Daily AI Forecast*\n"]
+
+    for chat_id, markets in WATCHLIST.items():
+        for slug in markets.keys():
+            try:
+                m = fetch_market_by_slug(slug)
+            except:
+                continue
+
+            question = m.get("question") or slug
+            prices = parse_outcome_prices(m)
+            if not prices:
+                continue
+
+            outcomes = parse_outcomes(m)
+
+            # fetch trades for sentiment
+            condition_id = m.get("conditionId")
+            trades = []
+            if condition_id:
+                try:
+                    trades = fetch_recent_trades(condition_id, 200)
+                except:
+                    trades = []
+
+            stats = compute_outcome_stats(trades, len(prices))
+            ai_probs = ai_model_probs(prices, stats)
+
+            # find outcome with biggest edge
+            edges = [ai - pr for ai, pr in zip(ai_probs, prices)]
+            best_idx = max(range(len(edges)), key=lambda i: abs(edges[i]))
+
+            market_prob = prices[best_idx]
+            ai_prob = ai_probs[best_idx]
+            edge = ai_prob - market_prob
+
+            outcome_name = outcomes[best_idx]
+
+            lines.append(
+                f"*{question}*\n"
+                f"- Best outcome: `{outcome_name}`\n"
+                f"- Market: `{market_prob*100:.2f}%`\n"
+                f"- AI: `{ai_prob*100:.2f}%`\n"
+                f"- Edge: `{edge*100:+.2f}%`\n"
+            )
+
+    lines.append("\n⚠️ This is not financial advice.")
+    return "\n".join(lines)
+
+
+def daily_summary_loop():
+    """
+    Sends summary once every 24 hours automatically.
+    """
+    last_sent_day = None
+
+    while True:
+        now = datetime.utcnow()
+        today = now.strftime("%Y-%m-%d")
+        hour = now.hour
+
+        # Send at 07:00 UTC
+        if hour == 7 and today != last_sent_day:
+            summary = build_daily_summary()
+
+            for chat_id in WATCHLIST.keys():
+                send_message(chat_id, summary)
+
+            last_sent_day = today
+
+        time.sleep(60)  # check every 1 min
+
+# =========================
+# TRADING SIGNAL GENERATOR (NEW)
+# =========================
+
+def generate_trading_signal(price: float, ai_prob: float):
+    """
+    Returns signal, confidence, risk, TP & SL based on AI vs market edge.
+    """
+
+    market_prob = price
+    edge = ai_prob - market_prob
+    abs_edge = abs(edge)
+
+    # Signal
+    if abs_edge < 0.03:
+        signal = "HOLD"
+    elif edge > 0:
+        signal = "BUY"
+    else:
+        signal = "SELL"
+
+    # Confidence
+    if abs_edge > 0.12:
+        confidence = "High"
+    elif abs_edge > 0.07:
+        confidence = "Medium"
+    else:
+        confidence = "Low"
+
+    # Risk (inversely related to confidence)
+    if confidence == "High":
+        risk = "Low"
+    elif confidence == "Medium":
+        risk = "Medium"
+    else:
+        risk = "High"
+
+    # TP & SL levels
+    entry_low  = max(0.01, price - 0.03)
+    entry_high = min(0.99, price + 0.03)
+
+    tp1 = min(0.99, price + abs_edge * 1.2)
+    tp2 = min(0.99, price + abs_edge * 2.0)
+
+    sl  = max(0.01, price - abs_edge * 1.2)
+
+    return {
+        "signal": signal,
+        "confidence": confidence,
+        "risk": risk,
+        "entry_low": entry_low,
+        "entry_high": entry_high,
+        "tp1": tp1,
+        "tp2": tp2,
+        "sl": sl
+    }
 
 
 # =========================
@@ -907,18 +1170,23 @@ def main() -> None:
             lower = text.strip().lower()
 
             if lower in ("/start", "start"):
-                send_message(
-                    chat_id,
-                    "Hi! 👋\n"
-                    "- Send me any *Polymarket* link (event or market) and I will analyse it.\n"
-                    "- If it’s an *event*, I’ll list the markets and you can reply `pick 1`, `pick 2`, etc.\n"
-                    "- `/watch <link> [threshold]` → auto alerts when AI edge is big.\n"
-                    "- `/watches` → see your watched markets.\n"
-                    "- `/unwatch` → clear your watches.\n"
-                    "- `/arb` → scan a small watchlist for internal arbitrage.\n\n"
-                    "⚠️ This is *not* financial advice. Markets are risky."
-                )
-                continue
+    send_message(
+        chat_id,
+        "👋 **Welcome to the Polymarket AI Bot!**\n\n"
+        "Here’s what I can do:\n"
+        "• 🔍 Analyse any *Polymarket market or event*\n"
+        "• 🎯 Show AI probability vs market probability\n"
+        "• 🐋 Detect *whales* and send instant alerts\n"
+        "• ⚡ Spot *big price movements*\n"
+        "• 🔔 Auto alerts when AI finds a big edge\n"
+        "• 📊 Daily prediction summaries\n"
+        "• ⭐ Trading Signals (BUY/SELL/HOLD + TP/SL)\n"
+        "• 🧮 Arbitrage detection (/arb)\n\n"
+        "Just send me a **Polymarket link** to begin!\n\n"
+        "⚠️ *This bot is not financial advice.*"
+    )
+    continue
+
 
             if lower.startswith("/watch"):
                 handle_watch_command(chat_id, text)
@@ -955,4 +1223,19 @@ def main() -> None:
 if __name__ == "__main__":
     # Run web dashboard + bot loop together
     threading.Thread(target=run_flask, daemon=True).start()
+
+    # Start alert loop (existing)
+    threading.Thread(target=alert_loop, daemon=True).start()
+
+    # Start whale alerts (new)
+    threading.Thread(target=whale_monitor_loop, daemon=True).start()
+
+    # Start price movement alerts (new)
+    threading.Thread(target=price_movement_loop, daemon=True).start()
+
+    # Start daily prediction summary (new)
+    threading.Thread(target=daily_summary_loop, daemon=True).start()
+
+    # Start main Telegram bot loop
     main()
+
