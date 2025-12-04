@@ -10,7 +10,9 @@ import requests
 # 1. CONFIG
 # =========================
 
-TELEGRAM_BOT_TOKEN = "8003716152:AAH6S5bBTW0V7IlNYw2EMaTtwxAyoi_dbFk"
+import os
+BOT_TOKEN = os.getenv("8003716152:AAG1R2sYtFjR0dpLQ-8AuYjelyR0YAMhOTY")
+
 
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 DATA_BASE = "https://data-api.polymarket.com"
