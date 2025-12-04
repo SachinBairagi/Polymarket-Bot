@@ -9,9 +9,9 @@ import requests
 # =========================
 # 1. CONFIG
 # =========================
-
 import os
-TELEGRAM_BOT_TOKEN = os.getenv("8003716152:AAEIojivsB10IoK_QX8lMV4sgpNC2twNaSI")
+
+TELEGRAM_BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not TELEGRAM_BOT_TOKEN:
     print("ERROR: TELEGRAM_BOT_TOKEN is not set. Check Render environment variables.")
 
