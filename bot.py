@@ -2,20 +2,21 @@ import time
 import json
 import re
 import math
+import os
+import threading
+from datetime import datetime
 from typing import Dict, Any, List, Optional
 
 import requests
+from flask import Flask, render_template_string
 
 # =========================
 # 1. CONFIG
 # =========================
-import os
 
 TELEGRAM_BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not TELEGRAM_BOT_TOKEN:
     print("ERROR: TELEGRAM_BOT_TOKEN is not set. Check Render environment variables.")
-
-
 
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 DATA_BASE = "https://data-api.polymarket.com"
@@ -30,17 +31,27 @@ INVEST_AMOUNT_USDC = 50.0
 EDGE_THRESHOLD = 0.07  # 7 percentage points
 
 # Whale definition (in USDC notional: size * price)
-MIN_WHALE_USDC = 1000.0  # you can change this (e.g. 500, 250, etc.)
+MIN_WHALE_USDC = 1000.0  # you can change this
 
-# Markets to include in /arb scan (edit this list)
+# Markets to include in /arb scan
 ARBITRAGE_WATCHLIST: List[str] = [
     "will-polymarket-us-go-live-in-2025",
-    # add more slugs here if you want
 ]
 
 # For event support: remember which event's markets a user can pick from
 PENDING_EVENT_SELECTION: Dict[int, List[Dict[str, Any]]] = {}
 
+# Auto-alert watchlist:
+# WATCHLIST[chat_id][slug] = {threshold, last_edge, last_alert_ts}
+WATCHLIST: Dict[int, Dict[str, Dict[str, Any]]] = {}
+
+# How often to check watched markets (in seconds)
+ALERT_CHECK_INTERVAL_SEC = 900  # 15 minutes
+MIN_ALERT_GAP_SEC = 1800        # min 30 min between alerts per market
+
+# For pretty formatting and dashboard
+SECTION_DIVIDER = "────────────────────────"
+LAST_ANALYSES: List[Dict[str, Any]] = []  # store recent analyses for web UI
 
 # =========================
 # 2. TELEGRAM HELPERS
@@ -61,9 +72,10 @@ def send_message(chat_id: int, text: str) -> None:
         "chat_id": chat_id,
         "text": text,
         "parse_mode": "Markdown",
+        "disable_web_page_preview": True,
     }
     try:
-        resp = requests.post(url, data=payload, timeout=10)
+        resp = requests.post(url, data=payload, timeout=15)
         if not resp.ok:
             print("[ERROR] Telegram send failed:", resp.text)
     except Exception as e:
@@ -75,10 +87,6 @@ def send_message(chat_id: int, text: str) -> None:
 # =========================
 
 def fetch_market_by_slug(slug: str) -> Dict[str, Any]:
-    """
-    Try to fetch a single market by slug.
-    Raises ValueError('MARKET_NOT_FOUND') on 404 so we can fall back to event mode.
-    """
     url = f"{GAMMA_BASE}/markets/slug/{slug}"
     resp = requests.get(url, timeout=10)
     if resp.status_code == 404:
@@ -88,10 +96,6 @@ def fetch_market_by_slug(slug: str) -> Dict[str, Any]:
 
 
 def fetch_event_by_slug(slug: str) -> Dict[str, Any]:
-    """
-    Fetch an event (which can contain many markets).
-    Raises ValueError('EVENT_NOT_FOUND') on 404.
-    """
     url = f"{GAMMA_BASE}/events/slug/{slug}"
     resp = requests.get(url, timeout=10)
     if resp.status_code == 404:
@@ -191,21 +195,19 @@ def sigmoid(x: float) -> float:
 
 def ai_model_probs(prices: List[float], stats: List[Dict[str, float]]) -> List[float]:
     """
-    More conservative AI-style regression:
+    Conservative regression-style AI:
       features:
         - market_prob
         - sentiment  = (buy - sell) / total
         - log_volume = log10(1 + total_vol)
         - momentum   = price - avg_trade_price
-      p_raw = sigmoid(w0 + w1*market_prob + w2*sentiment + w3*log_vol + w4*momentum)
-      then normalise to sum=1
     """
     n = len(prices)
     if n == 0:
         return []
 
     w0 = -0.5
-    w1 = 4.0   # strong weight on market price
+    w1 = 4.0   # market price
     w2 = 1.5   # sentiment
     w3 = 0.7   # volume
     w4 = 1.0   # momentum
@@ -221,7 +223,7 @@ def ai_model_probs(prices: List[float], stats: List[Dict[str, float]]) -> List[f
         avg_trade_price = stats[i]["avg_trade_price"]
 
         if total_vol > 0:
-            sentiment = (buy_vol - sell_vol) / total_vol  # [-1, 1]
+            sentiment = (buy_vol - sell_vol) / total_vol  # [-1,1]
         else:
             sentiment = 0.0
 
@@ -282,13 +284,13 @@ def aggregate_whale_flow(whales: List[Dict[str, Any]], n_outcomes: int) -> List[
 
 
 # =========================
-# 5. LINK & TEXT HELPERS
+# 5. TEXT & SIGNAL HELPERS
 # =========================
 
 def extract_polymarket_slug(text: str) -> Optional[str]:
     """
-    Extracts slug correctly even when URL contains ?tid=..., ?ref=..., fragments, etc.
-    Works for both /event/... and /market/...
+    Extract slug even if URL has ?tid=, ?ref=, #fragment, etc.
+    Works for /event/... and /market/...
     """
     m = re.search(r"https?://polymarket\.com/[^\s]+", text)
     if not m:
@@ -296,11 +298,8 @@ def extract_polymarket_slug(text: str) -> Optional[str]:
 
     url = m.group(0).rstrip("/")
 
-    # Remove query params
     if "?" in url:
         url = url.split("?", 1)[0]
-
-    # Remove hash fragments
     if "#" in url:
         url = url.split("#", 1)[0]
 
@@ -318,6 +317,25 @@ def recommendation_text(market_prob: float, ai_prob: float) -> str:
         return "AI sees this as *undervalued*. Consider **BUY** (if you agree)."
     else:
         return "AI sees this as *overpriced*. Consider **SELL/short or opposite side** (if possible)."
+
+
+def trading_signal(market_prob: float, ai_prob: float) -> str:
+    edge = ai_prob - market_prob
+    abs_edge = abs(edge)
+
+    if abs_edge < EDGE_THRESHOLD / 2:
+        return "😐 Signal: HOLD / AVOID (tiny edge)"
+
+    if edge > 0:
+        if abs_edge > EDGE_THRESHOLD * 2:
+            return "🔥 Signal: STRONG BUY (AI thinks heavily undervalued)"
+        else:
+            return "✅ Signal: BUY (AI sees some undervaluation)"
+    else:
+        if abs_edge > EDGE_THRESHOLD * 2:
+            return "⚠️ Signal: STRONG SELL / TAKE OPPOSITE SIDE (if possible)"
+        else:
+            return "⚠️ Signal: SELL / TRIM (AI sees mild overpricing)"
 
 
 def profit_scenario_text(price: float) -> str:
@@ -401,7 +419,8 @@ def analyse_market_object(chat_id: int, market: Dict[str, Any]) -> None:
 
     lines: List[str] = []
     lines.append(f"*Question:*\n{question}\n")
-    lines.append(f"*Stake used for examples:* `{INVEST_AMOUNT_USDC:.2f}` USDC\n")
+    lines.append(f"`{SECTION_DIVIDER}`")
+    lines.append(f"*Stake for examples:* `{INVEST_AMOUNT_USDC:.2f}` USDC\n")
     lines.append("*Outcome | Market % | AI % | Edge | Sentiment*")
 
     for i, price in enumerate(prices):
@@ -430,23 +449,27 @@ def analyse_market_object(chat_id: int, market: Dict[str, Any]) -> None:
             sent_label = "😐 neutral flow"
 
         lines.append(
-            f"- {name}: *{m_pct}%* → *{a_pct}%* "
+            f"- *{name}*: `{m_pct:.2f}%` → `AI {a_pct:.2f}%` "
             f"(edge: {edge:+.2f}%)  {sent_label}"
         )
 
+        sig_line = trading_signal(price, ai_probs[i])
+        lines.append(f"  ↳ {sig_line}")
+
         rec = recommendation_text(price, ai_probs[i])
         lines.append(f"  ↳ {rec}")
+
         lines.append("  ↳ " + profit_scenario_text(price))
+        lines.append("")
 
-    lines.append(f"\nMarket prob sum: `{total_market:.3f}`")
-    lines.append(f"AI prob sum: `{total_ai:.3f}`")
+    lines.append(f"Market prob sum: `{total_market:.3f}`")
+    lines.append(f"AI prob sum: `{total_ai:.3f}`\n")
 
-    lines.append("")
     lines.append(build_ai_summary(outcomes, prices, ai_probs))
 
     whales = detect_whales(trades, MIN_WHALE_USDC)
     if whales:
-        lines.append(f"\n*Individual whale trades (>{MIN_WHALE_USDC:.0f} USDC)*")
+        lines.append(f"\n*Whale trades (>{MIN_WHALE_USDC:.0f} USDC per trade)*")
         for w in whales:
             outcome_idx = w.get("outcomeIndex")
             if isinstance(outcome_idx, int) and 0 <= outcome_idx < len(outcomes):
@@ -474,11 +497,21 @@ def analyse_market_object(chat_id: int, market: Dict[str, Any]) -> None:
             f"\n_No trades above {MIN_WHALE_USDC:.0f} USDC detected (no whales under current threshold)._"
         )
 
-    send_message(chat_id, "\n".join(lines))
+    text = "\n".join(lines)
+    send_message(chat_id, text)
+
+    # store for dashboard
+    LAST_ANALYSES.append({
+        "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "question": question,
+        "text": text
+    })
+    if len(LAST_ANALYSES) > 50:
+        LAST_ANALYSES.pop(0)
 
 
 # =========================
-# 7. HANDLE LINKS (MARKET OR EVENT)
+# 7. HANDLE LINKS & EVENTS
 # =========================
 
 def handle_polymarket_link(chat_id: int, text: str) -> None:
@@ -489,7 +522,6 @@ def handle_polymarket_link(chat_id: int, text: str) -> None:
 
     send_message(chat_id, f"🔍 Reading Polymarket slug:\n`{slug}`")
 
-    # 1) Try as a single market
     try:
         market = fetch_market_by_slug(slug)
         analyse_market_object(chat_id, market)
@@ -499,11 +531,10 @@ def handle_polymarket_link(chat_id: int, text: str) -> None:
             print("[ERROR] market fetch failed:", e)
             send_message(chat_id, "❌ Error fetching market from Polymarket.")
             return
-        # if MARKET_NOT_FOUND then we try event
     except Exception as e:
         print("[ERROR] market fetch exception:", e)
 
-    # 2) Try as an event with many markets
+    # Try as event
     try:
         event = fetch_event_by_slug(slug)
     except ValueError as e:
@@ -520,7 +551,6 @@ def handle_polymarket_link(chat_id: int, text: str) -> None:
         send_message(chat_id, "I found the event, but it doesn’t have any markets yet.")
         return
 
-    # Save this list so user can 'pick 1', 'pick 2', etc.
     PENDING_EVENT_SELECTION[chat_id] = markets
 
     lines: List[str] = []
@@ -563,7 +593,156 @@ def handle_pick_command(chat_id: int, text: str) -> None:
 
 
 # =========================
-# 8. ARBITRAGE SCAN
+# 8. WATCHLIST & AUTO ALERTS
+# =========================
+
+def handle_watch_command(chat_id: int, text: str) -> None:
+    """
+    /watch <polymarket link> [threshold]
+    Example:
+      /watch https://polymarket.com/... 0.10
+    """
+    parts = text.split()
+    if len(parts) < 2:
+        send_message(chat_id, "Usage: `/watch <polymarket link> [edge_threshold]` (example: 0.10 for 10%)")
+        return
+
+    slug = extract_polymarket_slug(text)
+    if not slug:
+        send_message(chat_id, "I couldn’t find a Polymarket link in that message.")
+        return
+
+    threshold = EDGE_THRESHOLD
+    if len(parts) >= 3:
+        try:
+            threshold = float(parts[-1])
+        except Exception:
+            pass
+
+    if chat_id not in WATCHLIST:
+        WATCHLIST[chat_id] = {}
+    WATCHLIST[chat_id][slug] = {
+        "threshold": threshold,
+        "last_edge": None,
+        "last_alert_ts": 0.0,
+    }
+
+    send_message(chat_id, f"🔔 Watching `{slug}` with edge threshold `{threshold:.2f}` (i.e. {threshold*100:.1f}%).")
+
+
+def handle_unwatch_command(chat_id: int) -> None:
+    if chat_id in WATCHLIST:
+        WATCHLIST.pop(chat_id)
+        send_message(chat_id, "🧹 Cleared all watched markets for this chat.")
+    else:
+        send_message(chat_id, "You have no watched markets.")
+
+
+def handle_watches_command(chat_id: int) -> None:
+    markets = WATCHLIST.get(chat_id)
+    if not markets:
+        send_message(chat_id, "You’re not watching any markets.\nUse `/watch <link> [threshold]` to start.")
+        return
+
+    lines = ["*Watched markets:*"]
+    for slug, info in markets.items():
+        lines.append(f"- `{slug}` (edge threshold: {info['threshold']:.2f})")
+    send_message(chat_id, "\n".join(lines))
+
+
+def alert_loop() -> None:
+    """
+    Background loop that periodically checks all watched markets
+    and sends alerts when AI edge crosses the threshold.
+    """
+    while True:
+        try:
+            if not WATCHLIST:
+                time.sleep(ALERT_CHECK_INTERVAL_SEC)
+                continue
+
+            now = time.time()
+
+            for chat_id, markets in list(WATCHLIST.items()):
+                for slug, info in list(markets.items()):
+                    try:
+                        market = fetch_market_by_slug(slug)
+                    except Exception as e:
+                        print(f"[ALERT] failed to fetch {slug}:", e)
+                        continue
+
+                    prices = parse_outcome_prices(market)
+                    outcomes = parse_outcomes(market)
+                    condition_id = market.get("conditionId")
+
+                    trades: List[Dict[str, Any]] = []
+                    stats: List[Dict[str, float]] = []
+
+                    if condition_id:
+                        try:
+                            trades = fetch_recent_trades(condition_id, RECENT_TRADES_LIMIT)
+                            stats = compute_outcome_stats(trades, len(prices))
+                        except Exception as e:
+                            print("[ALERT] trades fetch failed:", e)
+                            stats = [{"buy_vol": 0.0, "sell_vol": 0.0,
+                                      "total_vol": 0.0, "trade_count": 0,
+                                      "avg_trade_price": prices[i]}
+                                     for i in range(len(prices))]
+                    else:
+                        stats = [{"buy_vol": 0.0, "sell_vol": 0.0,
+                                  "total_vol": 0.0, "trade_count": 0,
+                                  "avg_trade_price": prices[i]}
+                                 for i in range(len(prices))]
+
+                    ai_probs = ai_model_probs(prices, stats)
+                    if not ai_probs:
+                        continue
+
+                    best_idx = max(range(len(ai_probs)), key=lambda i: abs(ai_probs[i] - prices[i]))
+                    best_ai = ai_probs[best_idx]
+                    best_mkt = prices[best_idx]
+                    best_name = outcomes[best_idx] if best_idx < len(outcomes) else f"Outcome {best_idx}"
+                    edge = best_ai - best_mkt
+                    abs_edge = abs(edge)
+
+                    threshold = info["threshold"]
+                    last_edge = info.get("last_edge")
+                    last_alert_ts = info.get("last_alert_ts", 0.0)
+
+                    should_alert = (
+                        abs_edge >= threshold and
+                        (last_edge is None or abs(last_edge) < threshold * 0.9 or (edge * last_edge) < 0) and
+                        (now - last_alert_ts) >= MIN_ALERT_GAP_SEC
+                    )
+
+                    if should_alert:
+                        question = market.get("question") or market.get("title") or slug
+                        sig_line = trading_signal(best_mkt, best_ai)
+                        msg = (
+                            f"📢 *Auto alert for watched market*\n"
+                            f"`{slug}`\n\n"
+                            f"*Question:*\n{question}\n\n"
+                            f"Top edge outcome: *{best_name}*\n"
+                            f"- Market: `{best_mkt*100:.2f}%`\n"
+                            f"- AI: `{best_ai*100:.2f}%`\n"
+                            f"- Edge: `{(best_ai - best_mkt)*100:+.2f}%`\n\n"
+                            f"{sig_line}\n"
+                            f"_Threshold: {threshold*100:.1f}% | Auto alerts every ~{ALERT_CHECK_INTERVAL_SEC//60} min_"
+                        )
+                        send_message(chat_id, msg)
+                        info["last_edge"] = edge
+                        info["last_alert_ts"] = now
+                    else:
+                        info["last_edge"] = edge
+
+        except Exception as e:
+            print("[ALERT LOOP ERROR]", e)
+
+        time.sleep(ALERT_CHECK_INTERVAL_SEC)
+
+
+# =========================
+# 9. ARBITRAGE SCAN
 # =========================
 
 def check_market_arbitrage(slug: str) -> Optional[str]:
@@ -614,12 +793,92 @@ def handle_arb_command(chat_id: int) -> None:
 
 
 # =========================
-# 9. MAIN LOOP
+# 10. SIMPLE WEB DASHBOARD (Flask)
+# =========================
+
+app = Flask(__name__)
+
+DASHBOARD_TEMPLATE = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Polymarket Bot Dashboard</title>
+  <style>
+    body { font-family: system-ui, -apple-system, sans-serif; background:#0b0f19; color:#f5f5f5; padding:20px; }
+    h1 { color:#7ad7ff; }
+    .card { border:1px solid #333; padding:12px 16px; margin-bottom:16px; border-radius:8px; background:#111827; }
+    .small { font-size:12px; color:#9ca3af; }
+    pre { white-space:pre-wrap; word-wrap:break-word; font-size:13px; }
+  </style>
+</head>
+<body>
+  <h1>Polymarket AI Bot Dashboard</h1>
+  <p class="small">Live summaries of recent analyses and watched markets.</p>
+
+  <h2>Watched Markets</h2>
+  {% if not watchlist %}
+    <p class="small">No active watches. Use /watch in Telegram.</p>
+  {% else %}
+    {% for chat_id, mkts in watchlist.items() %}
+      <div class="card">
+        <div class="small">Chat ID: {{ chat_id }}</div>
+        <ul>
+        {% for slug, info in mkts.items() %}
+          <li><code>{{ slug }}</code> — threshold: {{ '%.2f'|format(info.threshold) }}</li>
+        {% endfor %}
+        </ul>
+      </div>
+    {% endfor %}
+  {% endif %}
+
+  <h2>Recent Analyses</h2>
+  {% if not analyses %}
+    <p class="small">No analyses yet.</p>
+  {% else %}
+    {% for a in analyses %}
+      <div class="card">
+        <div class="small">{{ a.timestamp }}</div>
+        <div><strong>{{ a.question }}</strong></div>
+        <pre>{{ a.text }}</pre>
+      </div>
+    {% endfor %}
+  {% endif %}
+</body>
+</html>
+"""
+
+@app.route("/")
+def index():
+    # create simple structures for template
+    watch_display = {}
+    for cid, mkts in WATCHLIST.items():
+        watch_display[cid] = {}
+        for slug, info in mkts.items():
+            watch_display[cid][slug] = type("Info", (), info)
+
+    return render_template_string(
+        DASHBOARD_TEMPLATE,
+        watchlist=watch_display,
+        analyses=LAST_ANALYSES[-10:][::-1],
+    )
+
+
+def run_flask():
+    port = int(os.getenv("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
+
+
+# =========================
+# 11. MAIN LOOP
 # =========================
 
 def main() -> None:
-    print("Advanced Polymarket bot (with event support) started. Send a Polymarket link or /arb.")
+    print("Advanced Polymarket bot (with events, AI, alerts, dashboard) started.")
     last_update_id: Optional[int] = None
+
+    # Start alert loop in background
+    threading.Thread(target=alert_loop, daemon=True).start()
 
     while True:
         try:
@@ -647,43 +906,53 @@ def main() -> None:
 
             lower = text.strip().lower()
 
-            # 1) Start
             if lower in ("/start", "start"):
                 send_message(
                     chat_id,
                     "Hi! 👋\n"
                     "- Send me any *Polymarket* link (event or market) and I will analyse it.\n"
                     "- If it’s an *event*, I’ll list the markets and you can reply `pick 1`, `pick 2`, etc.\n"
-                    "- I show market vs AI probability, sentiment, profit example, and whale flow.\n"
-                    "- Send `/arb` to scan a small watchlist for basic internal arbitrage.\n\n"
+                    "- `/watch <link> [threshold]` → auto alerts when AI edge is big.\n"
+                    "- `/watches` → see your watched markets.\n"
+                    "- `/unwatch` → clear your watches.\n"
+                    "- `/arb` → scan a small watchlist for internal arbitrage.\n\n"
                     "⚠️ This is *not* financial advice. Markets are risky."
                 )
                 continue
 
-            # 2) Arbitrage
+            if lower.startswith("/watch"):
+                handle_watch_command(chat_id, text)
+                continue
+
+            if lower == "/watches":
+                handle_watches_command(chat_id)
+                continue
+
+            if lower == "/unwatch":
+                handle_unwatch_command(chat_id)
+                continue
+
             if lower == "/arb":
                 handle_arb_command(chat_id)
                 continue
 
-            # 3) Pick command (for events)
             if lower.startswith("pick "):
                 handle_pick_command(chat_id, lower)
                 continue
 
-            # 4) Polymarket links
             if "polymarket.com" in text:
                 handle_polymarket_link(chat_id, text)
                 continue
 
-            # 5) Fallback
             send_message(
                 chat_id,
-                "Send me a *Polymarket* link (event or market), or use `/arb`.\n"
-                "Use `/start` to see a short help message."
+                "Send me a *Polymarket* link (event or market), or use `/watch`, `/arb`, `/start`."
             )
 
         time.sleep(POLL_INTERVAL_SEC)
 
 
 if __name__ == "__main__":
+    # Run web dashboard + bot loop together
+    threading.Thread(target=run_flask, daemon=True).start()
     main()
