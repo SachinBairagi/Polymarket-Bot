@@ -1110,9 +1110,6 @@ def main() -> None:
     print("Advanced Polymarket bot (with events, AI, alerts, dashboard) started.")
     last_update_id: Optional[int] = None
 
-    # Start alert loop in background
-    threading.Thread(target=alert_loop, daemon=True).start()
-
     while True:
         try:
             params: Dict[str, Any] = {"timeout": 25}
@@ -1133,31 +1130,31 @@ def main() -> None:
 
             chat_id = message["chat"]["id"]
             text = message.get("text", "")
-
             if not text:
                 continue
 
             lower = text.strip().lower()
 
+            # /start command
             if lower in ("/start", "start"):
-    send_message(
-        chat_id,
-        "👋 **Welcome to the Polymarket AI Bot!**\n\n"
-        "Here’s what I can do:\n"
-        "• 🔍 Analyse any *Polymarket market or event*\n"
-        "• 🎯 Show AI probability vs market probability\n"
-        "• 🐋 Detect *whales* and send instant alerts\n"
-        "• ⚡ Spot *big price movements*\n"
-        "• 🔔 Auto alerts when AI finds a big edge\n"
-        "• 📊 Daily prediction summaries\n"
-        "• ⭐ Trading Signals (BUY/SELL/HOLD + TP/SL)\n"
-        "• 🧮 Arbitrage detection (/arb)\n\n"
-        "Just send me a **Polymarket link** to begin!\n\n"
-        "⚠️ *This bot is not financial advice.*"
-    )
-    continue
+                send_message(
+                    chat_id,
+                    "👋 **Welcome to the Polymarket AI Bot!**\n\n"
+                    "Here’s what I can do:\n"
+                    "• 🔍 Analyse any *Polymarket* market or event\n"
+                    "• 🎯 Show AI probability vs market probability\n"
+                    "• 🐋 Detect *whales* and send instant alerts\n"
+                    "• ⚡ Spot *big price movements*\n"
+                    "• 🔔 Auto alerts when AI finds a big edge\n"
+                    "• 📊 Daily prediction summaries\n"
+                    "• ⭐ Trading Signals (BUY/SELL/HOLD + TP/SL)\n"
+                    "• 🧮 Arbitrage detection (`/arb`)\n\n"
+                    "Just send me a **Polymarket link** to begin!\n\n"
+                    "⚠️ *This bot is not financial advice.*"
+                )
+                continue
 
-
+            # watchlist commands
             if lower.startswith("/watch"):
                 handle_watch_command(chat_id, text)
                 continue
@@ -1170,22 +1167,27 @@ def main() -> None:
                 handle_unwatch_command(chat_id)
                 continue
 
+            # arbitrage scan
             if lower == "/arb":
                 handle_arb_command(chat_id)
                 continue
 
+            # event market picking
             if lower.startswith("pick "):
                 handle_pick_command(chat_id, lower)
                 continue
 
+            # polymarket link detection
             if "polymarket.com" in text:
                 handle_polymarket_link(chat_id, text)
                 continue
 
+            # Default fallback message
             send_message(
                 chat_id,
-                "Send me a *Polymarket* link (event or market), or use `/watch`, `/arb`, `/start`."
+                "Send me a *Polymarket* link (event or market), or use `/watch`, `/watches`, `/unwatch`, `/arb`, or `/start`."
             )
+            continue
 
         time.sleep(POLL_INTERVAL_SEC)
 
@@ -1208,4 +1210,3 @@ if __name__ == "__main__":
 
     # Start main Telegram bot loop
     main()
-
