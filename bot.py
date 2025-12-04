@@ -11,7 +11,10 @@ import requests
 # =========================
 
 import os
-BOT_TOKEN = os.getenv("8003716152:AAG1R2sYtFjR0dpLQ-8AuYjelyR0YAMhOTY")
+TELEGRAM_BOT_TOKEN = os.getenv("8003716152:AAG1R2sYtFjR0dpLQ-8AuYjelyR0YAMhOTY")
+if not TELEGRAM_BOT_TOKEN:
+    print("ERROR: TELEGRAM_BOT_TOKEN is not set. Check Render environment variables.")
+
 
 
 GAMMA_BASE = "https://gamma-api.polymarket.com"
