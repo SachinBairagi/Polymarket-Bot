@@ -388,43 +388,44 @@ def analyse_market_object(chat_id: int, market: Dict[str, Any]) -> None:
     question = market.get("question") or market.get("title") or "Unknown question"
     outcomes = parse_outcomes(market)
     prices = parse_outcome_prices(market)
+
     if not prices:
         send_message(chat_id, "I couldn’t read prices for that market.")
         return
 
     condition_id = market.get("conditionId")
-    trades: List[Dict[str, Any]] = []
-    stats: List[Dict[str, float]] = []
+    trades = []
+    stats = []
 
     if condition_id:
         try:
             trades = fetch_recent_trades(condition_id, RECENT_TRADES_LIMIT)
             stats = compute_outcome_stats(trades, len(prices))
-        except Exception as e:
-            print("[WARN] trades fetch failed:", e)
-            stats = [{"buy_vol": 0.0, "sell_vol": 0.0,
-                      "total_vol": 0.0, "trade_count": 0,
-                      "avg_trade_price": prices[i]}
-                     for i in range(len(prices))]
+        except:
+            stats = [
+                {"buy_vol": 0, "sell_vol": 0, "total_vol": 0, "trade_count": 0,
+                 "avg_trade_price": prices[i]}
+                for i in range(len(prices))
+            ]
     else:
-        stats = [{"buy_vol": 0.0, "sell_vol": 0.0,
-                  "total_vol": 0.0, "trade_count": 0,
-                  "avg_trade_price": prices[i]}
-                 for i in range(len(prices))]
+        stats = [
+            {"buy_vol": 0, "sell_vol": 0, "total_vol": 0, "trade_count": 0,
+             "avg_trade_price": prices[i]}
+            for i in range(len(prices))
+        ]
 
     ai_probs = ai_model_probs(prices, stats)
 
     total_market = sum(prices)
     total_ai = sum(ai_probs)
 
-   lines: List[str] = []
+    lines: List[str] = []
 
-lines.append("🧠 **Market Analysis**")
-lines.append(f"**Question:**\n{question}\n")
-lines.append(f"{SECTION_DIVIDER}\n")
-lines.append(f"📌 **Stake Used for Examples:** `{INVEST_AMOUNT_USDC:.2f}` USDC\n")
-lines.append("➡️ **Outcome Comparison (Market vs AI)**\n")
-
+    lines.append("🧠 **Market Analysis**")
+    lines.append(f"**Question:**\n{question}\n")
+    lines.append(f"{SECTION_DIVIDER}\n")
+    lines.append(f"📌 **Stake Used for Examples:** `{INVEST_AMOUNT_USDC:.2f}` USDC\n")
+    lines.append("➡️ **Outcome Comparison (Market vs AI)**\n")
 
     for i, price in enumerate(prices):
         name = outcomes[i] if i < len(outcomes) else f"Outcome {i}"
@@ -435,6 +436,7 @@ lines.append("➡️ **Outcome Comparison (Market vs AI)**\n")
         total_vol = stats[i]["total_vol"]
         buy_vol = stats[i]["buy_vol"]
         sell_vol = stats[i]["sell_vol"]
+
         if total_vol > 0:
             sentiment_val = (buy_vol - sell_vol) / total_vol
         else:
@@ -452,79 +454,47 @@ lines.append("➡️ **Outcome Comparison (Market vs AI)**\n")
             sent_label = "😐 neutral flow"
 
         lines.append(
-            f"- *{name}*: `{m_pct:.2f}%` → `AI {a_pct:.2f}%` "
-            f"(edge: {edge:+.2f}%)  {sent_label}"
+            f"\n**{name}**\n"
+            f"• Market: `{m_pct:.2f}%`\n"
+            f"• AI: `{a_pct:.2f}%`\n"
+            f"• Edge: `{edge:+.2f}%`\n"
+            f"• Sentiment: {sent_label}"
         )
 
-       sig_line = trading_signal(price, ai_probs[i])
-lines.append(f"  ↳ {sig_line}")
+        ts = generate_trading_signal(price, ai_probs[i])
+        lines.append(
+            f"  ↳ 🎯 *Trading Signal:* `{ts['signal']}`\n"
+            f"     Confidence: `{ts['confidence']}` | Risk: `{ts['risk']}`\n"
+            f"     Entry: `{ts['entry_low']:.2f} – {ts['entry_high']:.2f}`\n"
+            f"     TP1: `{ts['tp1']:.2f}` | TP2: `{ts['tp2']:.2f}` | SL: `{ts['sl']:.2f}`"
+        )
 
-# Trading signal block (NEW)
-ts = generate_trading_signal(price, ai_probs[i])
+        rec = recommendation_text(price, ai_probs[i])
+        lines.append(f"  ↳ 💡 *Recommendation:* {rec}")
 
-lines.append(
-    f"  ↳ 🎯 *Trading Signal*: {ts['signal']}\n"
-    f"     Confidence: {ts['confidence']}\n"
-    f"     Risk: {ts['risk']}\n"
-    f"     Entry: {ts['entry_low']:.2f} – {ts['entry_high']:.2f}\n"
-    f"     TP1: {ts['tp1']:.2f} | TP2: {ts['tp2']:.2f}\n"
-    f"     SL: {ts['sl']:.2f}"
-)
+        lines.append("  ↳ 💰 " + profit_scenario_text(price))
+        lines.append("")
 
-rec = recommendation_text(price, ai_probs[i])
-lines.append(f"  ↳ {rec}")
-
-lines.append("  ↳ " + profit_scenario_text(price))
-lines.append("")
-
-
-    lines.append(f"Market prob sum: `{total_market:.3f}`")
-    lines.append(f"AI prob sum: `{total_ai:.3f}`\n")
+    lines.append(f"📊 *Market prob sum:* `{total_market:.3f}`")
+    lines.append(f"🤖 *AI prob sum:* `{total_ai:.3f}`\n")
 
     lines.append(build_ai_summary(outcomes, prices, ai_probs))
 
     whales = detect_whales(trades, MIN_WHALE_USDC)
-    if whales:
-        lines.append(f"\n*Whale trades (>{MIN_WHALE_USDC:.0f} USDC per trade)*")
-        for w in whales:
-            outcome_idx = w.get("outcomeIndex")
-            if isinstance(outcome_idx, int) and 0 <= outcome_idx < len(outcomes):
-                outcome_name = outcomes[outcome_idx]
-            else:
-                outcome_name = f"Outcome {outcome_idx}"
-            lines.append(
-                f"- {w.get('side')} {outcome_name}: "
-                f"size {w.get('size')} @ {float(w.get('price', 0)):.3f} "
-                f"(≈{w['notional']:.0f} USDC)"
-            )
 
-        whale_flow = aggregate_whale_flow(whales, len(prices))
-        lines.append(f"\n*Whale flow by outcome (>{MIN_WHALE_USDC:.0f} USDC per trade)*")
-        for i, flow in enumerate(whale_flow):
-            if flow["buy_notional"] == 0 and flow["sell_notional"] == 0:
-                continue
-            name = outcomes[i] if i < len(outcomes) else f"Outcome {i}"
+    if whales:
+        lines.append(f"\n🐋 **Whale Trades (>{MIN_WHALE_USDC:.0f} USDC)**\n")
+        for w in whales:
+            idx = w.get("outcomeIndex")
+            name = outcomes[idx] if isinstance(idx, int) and 0 <= idx < len(outcomes) else f"Outcome {idx}"
             lines.append(
-                f"- {name}: whales BUY ≈ {flow['buy_notional']:.0f} USDC, "
-                f"SELL ≈ {flow['sell_notional']:.0f} USDC"
+                f"• {w['side']} `{name}` — {float(w['price']):.3f} × {w['size']} "
+                f"(≈ `{w['notional']:.0f}` USDC)"
             )
     else:
-        lines.append(
-            f"\n_No trades above {MIN_WHALE_USDC:.0f} USDC detected (no whales under current threshold)._"
-        )
+        lines.append("\n_No whale trades detected today._")
 
-    text = "\n".join(lines)
-    send_message(chat_id, text)
-
-    # store for dashboard
-    LAST_ANALYSES.append({
-        "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
-        "question": question,
-        "text": text
-    })
-    if len(LAST_ANALYSES) > 50:
-        LAST_ANALYSES.pop(0)
-
+    send_message(chat_id, "\n".join(lines))
 
 # =========================
 # 7. HANDLE LINKS & EVENTS
