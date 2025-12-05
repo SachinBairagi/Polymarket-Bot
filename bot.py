@@ -1032,7 +1032,7 @@ def alert_loop() -> None:
 
 
 # =========================
-# 9. WHALE ALERT LOOP
+# 9. WHALE ALERT LOOP  (with AI view + bet example)
 # =========================
 
 def parse_trade_timestamp(trade: Dict[str, Any]) -> float:
@@ -1050,11 +1050,14 @@ def parse_trade_timestamp(trade: Dict[str, Any]) -> float:
 
 def whale_alert_loop() -> None:
     """
-    Yes, add a GLOBAL_WATCHLIST scanner.
+    Whale radar for markets you have sent links for.
 
-    Every 5 minutes, check all subscribed markets for new trades.
-    If there are new trades since last check, send a summary.
-    Highlight whale trades (>= MIN_WHALE_USDC).
+    Every WHALE_ALERT_INTERVAL_SEC seconds (default 300s):
+    - For each subscribed market:
+        - Fetch recent trades
+        - Look at trades in the last WHALE_ALERT_INTERVAL_SEC seconds
+        - Highlight whale trades (>= MIN_WHALE_USDC)
+        - For the biggest whale: show AI edge + example bet & EV on that side.
     Works WITHOUT /watch – just sending a link subscribes the chat automatically.
     """
     while True:
@@ -1062,6 +1065,9 @@ def whale_alert_loop() -> None:
             if not WHALE_SUBSCRIPTIONS:
                 time.sleep(WHALE_ALERT_INTERVAL_SEC)
                 continue
+
+            now = time.time()
+            cutoff = now - WHALE_ALERT_INTERVAL_SEC
 
             for chat_id, subs in list(WHALE_SUBSCRIPTIONS.items()):
                 if not WHALE_ALERT_ENABLED.get(chat_id, True):
@@ -1077,27 +1083,30 @@ def whale_alert_loop() -> None:
                     if not trades:
                         continue
 
+                    # compute timestamps
+                    all_ts_zero = True
                     for t in trades:
                         t["_ts"] = parse_trade_timestamp(t)
+                        if t["_ts"] > 0:
+                            all_ts_zero = False
+
                     trades.sort(key=lambda x: x["_ts"], reverse=True)
-                    latest_ts = trades[0]["_ts"]
 
-                    last_seen = info.get("last_seen_time", 0.0)
+                    if all_ts_zero:
+                        # Fallback: if we couldn't parse timestamps at all,
+                        # just treat the top N trades as "recent".
+                        recent_trades = trades[:50]
+                    else:
+                        recent_trades = [t for t in trades if t["_ts"] >= cutoff]
 
-                    if last_seen == 0.0:
-                        info["last_seen_time"] = latest_ts
+                    if not recent_trades:
                         continue
-
-                    new_trades = [t for t in trades if t["_ts"] > last_seen]
-                    if not new_trades:
-                        continue
-
-                    info["last_seen_time"] = latest_ts
 
                     slug = info.get("slug", condition_id)
+
                     whale_trades = []
                     normal_trades = []
-                    for t in new_trades:
+                    for t in recent_trades:
                         try:
                             size = float(t.get("size", 0) or 0.0)
                             price = float(t.get("price", 0) or 0.0)
@@ -1112,27 +1121,87 @@ def whale_alert_loop() -> None:
                         else:
                             normal_trades.append(t)
 
+                    if not recent_trades:
+                        continue
+
                     lines: List[str] = []
-                    lines.append("⏰ *New trades detected (last 5 min)*")
+                    lines.append(f"⏰ *New trades (last {WHALE_ALERT_INTERVAL_SEC//60} min)*")
                     lines.append(f"`{slug}`")
-                    lines.append(f"Total new trades: *{len(new_trades)}*")
+                    lines.append(f"Total new trades (sample): *{len(recent_trades)}*")
+
+                    # Default values in case AI/market fetch fails
+                    ai_section_added = False
+
                     if whale_trades:
+                        whale_trades.sort(key=lambda x: x.get("notional", 0.0), reverse=True)
                         lines.append(f"🐋 Whale trades (≥{MIN_WHALE_USDC:.0f} USDC): *{len(whale_trades)}*")
                         for w in whale_trades[:5]:
-                            side = (w.get("side") or "").upper()
-                            outcome_idx = w.get("outcomeIndex")
+                            side = (w.get('side') or '').upper()
+                            outcome_idx = w.get('outcomeIndex')
                             outcome_str = f"Outcome {outcome_idx}"
                             lines.append(
                                 f"- {side} {outcome_str}: "
                                 f"size {w.get('size')} @ {float(w.get('price', 0)):.3f} "
                                 f"(≈{w['notional']:.0f} USDC)"
                             )
+
+                        # === AI view + bet example for the biggest whale side ===
+                        top_whale = whale_trades[0]
+                        try:
+                            market = fetch_market_by_slug(slug)
+                            prices = parse_outcome_prices(market)
+                            outcomes = parse_outcomes(market)
+                            stats = compute_outcome_stats(trades, len(prices))
+                            ai_probs = ai_model_probs(prices, stats)
+                        except Exception as e:
+                            print(f"[WHALE ALERT] AI fetch failed for {slug}:", e)
+                            prices, outcomes, ai_probs = [], [], []
+
+                        outcome_idx = top_whale.get("outcomeIndex")
+                        if (
+                            isinstance(outcome_idx, int)
+                            and prices
+                            and ai_probs
+                            and 0 <= outcome_idx < len(prices)
+                            and 0 <= outcome_idx < len(ai_probs)
+                        ):
+                            outcome_name = (
+                                outcomes[outcome_idx]
+                                if outcome_idx < len(outcomes)
+                                else f"Outcome {outcome_idx}"
+                            )
+                            p = max(0.01, min(0.99, float(prices[outcome_idx])))
+                            q = max(0.0, min(1.0, float(ai_probs[outcome_idx])))
+                            edge_pct = (q - p) * 100.0
+
+                            stake = INVEST_AMOUNT_USDC
+                            payoff_if_win = stake / p
+                            profit_if_win = payoff_if_win - stake
+                            ev = stake * (q / p - 1.0)
+
+                            lines.append("")
+                            lines.append("🤖 *AI view on top whale side*")
+                            lines.append(f"- Outcome: *{outcome_name}* ({(top_whale.get('side') or '').upper()})")
+                            lines.append(f"- Market prob: `{p*100:.2f}%`")
+                            lines.append(f"- AI prob: `{q*100:.2f}%` (edge `{edge_pct:+.2f}%`)")
+                            lines.append(
+                                f"💰 Example bet `{stake:.2f}` USDC → "
+                                f"if wins ≈ `{payoff_if_win:.2f}` (profit `{profit_if_win:.2f}`), "
+                                f"EV ≈ `{ev:.2f}` USDC."
+                            )
+                            ai_section_added = True
+
                     else:
-                        lines.append("🐋 No whale trades in this batch.")
+                        lines.append("🐋 No whale trades in this batch (only smaller orders).")
+
+                    if not ai_section_added:
+                        lines.append(
+                            "\n🤖 AI view not available for this batch (could not fetch prices or outcome index)."
+                        )
 
                     lines.append(
-                        "_You can turn these alerts off with `/alerts_off`, "
-                        "and back on with `/alerts_on`._"
+                        "_You can turn these alerts off with `/alerts_off`, and back on with `/alerts_on`. "
+                        "This info is not financial advice._"
                     )
 
                     send_message(chat_id, "\n".join(lines))
@@ -1436,7 +1505,7 @@ def run_flask():
 # =========================
 
 def main() -> None:
-    print("Advanced Polymarket bot (events, AI, whale alerts, global scanner, bet calc, dashboard) started.")
+    print("Advanced Polymarket bot (events, AI, whale alerts with AI, global scanner, bet calc, dashboard) started.")
     last_update_id: Optional[int] = None
 
     # Background loops
@@ -1479,7 +1548,7 @@ def main() -> None:
                     "- If it’s an *event*, I’ll list markets and you can reply `pick 1`, `pick 2`, etc.\n"
                     "- I show AI vs market %, trading signals, whales, and profit examples.\n"
                     "- After analysis, reply with an amount (e.g. `50`) for an AI bet calculator.\n"
-                    "- Whale / new trade alerts run every 5 min for markets you send (use `/alerts_off` to stop).\n"
+                    "- Whale alerts run every 5 min on markets you send and now include AI edge + example bet.\n"
                     "- A global scanner runs every ~1 min across Trending + categories (Politics, Sports, Crypto, etc.) and pushes top AI edges + arb hints.\n"
                     "- `/watch <link> [threshold]` → edge-based alerts for specific markets.\n"
                     "- `/watches`, `/unwatch` to manage your watchlist.\n"
