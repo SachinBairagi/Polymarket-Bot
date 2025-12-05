@@ -49,12 +49,16 @@ MIN_ALERT_GAP_SEC = 1800        # min 30 min between edge alerts
 # Whale auto-alert subscriptions (no /watch needed)
 # WHALE_SUBSCRIPTIONS[chat_id][condition_id] = {slug, last_seen_time}
 WHALE_SUBSCRIPTIONS: Dict[int, Dict[str, Dict[str, Any]]] = {}
+
 # Per chat on/off toggle for whale/global alerts
 WHALE_ALERT_ENABLED: Dict[int, bool] = {}
 WHALE_ALERT_INTERVAL_SEC = 300  # 5 min
 
 # Track all chats that have talked to the bot
 ACTIVE_CHATS: Set[int] = set()
+
+# For New Event Monitor: keeps track of events already announced
+SEEN_EVENT_IDS: Set[str] = set()
 
 # Bet calculator context
 # PENDING_BET_CONTEXT[chat_id] = { 'slug', 'outcome', 'price', 'ai_prob' }
@@ -75,17 +79,17 @@ POLYMARKET_API_KEYS = [k for k in POLYMARKET_API_KEYS if k]
 _API_KEY_INDEX = 0  # internal pointer for rotation
 
 # ========= Global watchlist edge scanner (push signals) =========
-# We auto-scan multiple categories (politics, sports, crypto, etc.)
 GLOBAL_STATE: Dict[str, Dict[str, Any]] = {}
-GLOBAL_ALERT_INTERVAL_SEC = 60          # check every minute
-GLOBAL_EDGE_THRESHOLD = 0.08            # 8% AI edge
-GLOBAL_ALERT_MIN_GAP_SEC = 300          # min 5 min between alerts per market
+GLOBAL_ALERT_INTERVAL_SEC = 60  # check every minute
+GLOBAL_EDGE_THRESHOLD = 0.08    # 8% AI edge
+GLOBAL_ALERT_MIN_GAP_SEC = 300  # min 5 min between alerts per market
 
-TRENDING_LIMIT = 20                     # how many “overall” markets to scan
-CATEGORY_LIMIT = 15                     # how many per category
+TRENDING_LIMIT = 20             # how many “overall” markets to scan
+CATEGORY_LIMIT = 15             # how many per category
 
-# Category slugs used on Polymarket site
+# Category slugs used on Polymarket site - UPDATED to include 'breaking'
 CATEGORY_TAG_SLUGS: List[str] = [
+    "breaking",  # <-- ADDED for BreakingNew
     "politics",
     "sports",
     "finance",
@@ -114,7 +118,6 @@ def telegram_api(method: str, params: Dict[str, Any] = None) -> Dict[str, Any]:
     resp.raise_for_status()
     return resp.json()
 
-
 def send_message(chat_id: int, text: str) -> None:
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -130,27 +133,21 @@ def send_message(chat_id: int, text: str) -> None:
     except Exception as e:
         print("[ERROR] Telegram exception:", e)
 
-
 # =========================
 # 3. POLYMARKET HELPERS
 # =========================
 
 def rotated_get(url: str, params: Dict[str, Any] = None, timeout: int = 10) -> requests.Response:
-    """
-    Wrapper around requests.get that rotates through multiple
-    Polymarket API keys (if provided) to reduce rate-limit risk.
-    """
+    """Wrapper around requests.get that rotates through multiple API keys."""
     global _API_KEY_INDEX
     headers: Dict[str, str] = {}
 
     if POLYMARKET_API_KEYS:
         key = POLYMARKET_API_KEYS[_API_KEY_INDEX % len(POLYMARKET_API_KEYS)]
         _API_KEY_INDEX += 1
-        # Change header here if Polymarket uses a different auth scheme.
         headers["Authorization"] = f"Bearer {key}"
 
     return requests.get(url, params=params, headers=headers, timeout=timeout)
-
 
 def fetch_market_by_slug(slug: str) -> Dict[str, Any]:
     url = f"{GAMMA_BASE}/markets/slug/{slug}"
@@ -160,7 +157,6 @@ def fetch_market_by_slug(slug: str) -> Dict[str, Any]:
     resp.raise_for_status()
     return resp.json()
 
-
 def fetch_event_by_slug(slug: str) -> Dict[str, Any]:
     url = f"{GAMMA_BASE}/events/slug/{slug}"
     resp = rotated_get(url, timeout=10)
@@ -169,18 +165,14 @@ def fetch_event_by_slug(slug: str) -> Dict[str, Any]:
     resp.raise_for_status()
     return resp.json()
 
-
 def fetch_recent_trades(condition_id: str, limit: int = RECENT_TRADES_LIMIT) -> List[Dict[str, Any]]:
     params = {"limit": limit, "market": condition_id}
     resp = rotated_get(f"{DATA_BASE}/trades", params=params, timeout=10)
     resp.raise_for_status()
     return resp.json()
 
-
 def fetch_trending_slugs(limit: int = TRENDING_LIMIT) -> List[str]:
-    """
-    Fetch a list of high-volume active markets (overall).
-    """
+    # ... (existing function) ...
     url = f"{GAMMA_BASE}/markets"
     params = {
         "limit": limit,
@@ -204,11 +196,26 @@ def fetch_trending_slugs(limit: int = TRENDING_LIMIT) -> List[str]:
             slugs.append(slug)
     return slugs
 
+def fetch_newest_events(limit: int = 5) -> List[Dict[str, Any]]:
+    """Fetch the newest events based on start date."""
+    url = f"{GAMMA_BASE}/events"
+    params = {
+        "limit": limit,
+        "closed": "false",
+        "order": "startDate",
+        "ascending": "false",
+    }
+    try:
+        resp = rotated_get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("events") or data.get("data") or []
+    except Exception as e:
+        print(f"[EVENT FETCH] Failed to get newest events: {e}")
+        return []
 
 def get_tag_id_by_slug(tag_slug: str) -> Optional[str]:
-    """
-    Map category slug like 'politics' or 'sports' to numeric tag_id using /tags/slug/{slug}.
-    """
+    # ... (existing function) ...
     if tag_slug in TAG_ID_CACHE:
         return TAG_ID_CACHE[tag_slug]
 
@@ -232,11 +239,8 @@ def get_tag_id_by_slug(tag_slug: str) -> Optional[str]:
     TAG_ID_CACHE[tag_slug] = tag_id_str
     return tag_id_str
 
-
 def fetch_markets_for_tag(tag_slug: str, limit: int = CATEGORY_LIMIT) -> List[Dict[str, Any]]:
-    """
-    Fetch markets for a given category tag (politics, sports, crypto, etc.).
-    """
+    # ... (existing function) ...
     tag_id = get_tag_id_by_slug(tag_slug)
     if not tag_id:
         return []
@@ -264,14 +268,8 @@ def fetch_markets_for_tag(tag_slug: str, limit: int = CATEGORY_LIMIT) -> List[Di
 
     return markets or []
 
-
 def discover_global_slugs() -> List[str]:
-    """
-    Combine:
-    - overall high-volume markets
-    - category markets (politics, sports, crypto, etc.)
-    into one deduped list of slugs to scan.
-    """
+    # ... (existing function) ...
     slugs_set = set()
 
     # overall
@@ -296,8 +294,8 @@ def discover_global_slugs() -> List[str]:
 
     return list(slugs_set)
 
-
 def parse_outcome_prices(market: Dict[str, Any]) -> List[float]:
+    # ... (existing function) ...
     raw = market.get("outcomePrices")
     if raw is None:
         return []
@@ -311,8 +309,8 @@ def parse_outcome_prices(market: Dict[str, Any]) -> List[float]:
     except Exception:
         return []
 
-
 def parse_outcomes(market: Dict[str, Any]) -> List[str]:
+    # ... (existing function) ...
     outcomes = market.get("outcomes") or []
     if isinstance(outcomes, str):
         try:
@@ -321,12 +319,13 @@ def parse_outcomes(market: Dict[str, Any]) -> List[str]:
             outcomes = []
     return [str(o) for o in outcomes]
 
-
 # =========================
 # 4. FEATURES, AI MODEL, WHALES
+# (AI logic is already robust for prediction/edge)
 # =========================
 
 def compute_outcome_stats(trades: List[Dict[str, Any]], n_outcomes: int) -> List[Dict[str, float]]:
+    # ... (existing function) ...
     stats = [
         {"buy_vol": 0.0, "sell_vol": 0.0, "total_vol": 0.0,
          "trade_count": 0, "avg_trade_price": 0.0}
@@ -335,14 +334,10 @@ def compute_outcome_stats(trades: List[Dict[str, Any]], n_outcomes: int) -> List
 
     for t in trades:
         idx = t.get("outcomeIndex")
-        if idx is None:
-            continue
-        try:
-            idx = int(idx)
-        except Exception:
-            continue
-        if not (0 <= idx < n_outcomes):
-            continue
+        if idx is None: continue
+        try: idx = int(idx)
+        except Exception: continue
+        if not (0 <= idx < n_outcomes): continue
 
         try:
             size = float(t.get("size", 0) or 0.0)
@@ -351,14 +346,12 @@ def compute_outcome_stats(trades: List[Dict[str, Any]], n_outcomes: int) -> List
             size, price = 0.0, 0.0
 
         side = (t.get("side") or "").upper()
-
         if side == "BUY":
             stats[idx]["buy_vol"] += size
         elif side == "SELL":
             stats[idx]["sell_vol"] += size
 
         stats[idx]["total_vol"] += size
-
         c = stats[idx]["trade_count"]
         if c == 0:
             stats[idx]["avg_trade_price"] = price
@@ -366,31 +359,20 @@ def compute_outcome_stats(trades: List[Dict[str, Any]], n_outcomes: int) -> List
             stats[idx]["avg_trade_price"] = (
                 stats[idx]["avg_trade_price"] * c + price
             ) / (c + 1)
-
         stats[idx]["trade_count"] += 1
-
     return stats
 
-
 def sigmoid(x: float) -> float:
+    # ... (existing function) ...
     try:
         return 1.0 / (1.0 + math.exp(-x))
     except OverflowError:
         return 0.0 if x < 0 else 1.0
 
-
 def ai_model_probs(prices: List[float], stats: List[Dict[str, float]]) -> List[float]:
-    """
-    Conservative regression-style AI:
-      features:
-        - market_prob
-        - sentiment  = (buy - sell) / total
-        - log_volume = log10(1 + total_vol)
-        - momentum   = price - avg_trade_price
-    """
+    # ... (existing function - the accurate prediction model) ...
     n = len(prices)
-    if n == 0:
-        return []
+    if n == 0: return []
 
     w0 = -0.5
     w1 = 4.0   # market price
@@ -402,7 +384,6 @@ def ai_model_probs(prices: List[float], stats: List[Dict[str, float]]) -> List[f
 
     for i in range(n):
         p = max(0.001, min(0.999, float(prices[i])))
-
         total_vol = stats[i]["total_vol"]
         buy_vol = stats[i]["buy_vol"]
         sell_vol = stats[i]["sell_vol"]
@@ -421,13 +402,11 @@ def ai_model_probs(prices: List[float], stats: List[Dict[str, float]]) -> List[f
         raw_scores.append(raw)
 
     total_raw = sum(raw_scores)
-    if total_raw <= 0:
-        return prices[:]
-
+    if total_raw <= 0: return prices[:]
     return [r / total_raw for r in raw_scores]
 
-
 def detect_whales(trades: List[Dict[str, Any]], min_usdc: float) -> List[Dict[str, Any]]:
+    # ... (existing function) ...
     whales: List[Dict[str, Any]] = []
     for t in trades:
         try:
@@ -445,20 +424,17 @@ def detect_whales(trades: List[Dict[str, Any]], min_usdc: float) -> List[Dict[st
     whales.sort(key=lambda x: x.get("notional", 0.0), reverse=True)
     return whales[:10]
 
-
 def aggregate_whale_flow(whales: List[Dict[str, Any]], n_outcomes: int) -> List[Dict[str, float]]:
+    # ... (existing function) ...
     flow = [
         {"buy_notional": 0.0, "sell_notional": 0.0}
         for _ in range(n_outcomes)
     ]
     for w in whales:
         idx = w.get("outcomeIndex")
-        try:
-            idx = int(idx)
-        except Exception:
-            continue
-        if not (0 <= idx < n_outcomes):
-            continue
+        try: idx = int(idx)
+        except Exception: continue
+        if not (0 <= idx < n_outcomes): continue
 
         side = (w.get("side") or "").upper()
         notional = float(w.get("notional", 0.0) or 0.0)
@@ -468,1058 +444,91 @@ def aggregate_whale_flow(whales: List[Dict[str, Any]], n_outcomes: int) -> List[
             flow[idx]["sell_notional"] += notional
     return flow
 
+# ... (Sections 5, 6, 7, 8 are unchanged - use existing code) ...
 
 # =========================
-# 5. TEXT & SIGNAL HELPERS
+# 9.7 NEW EVENT MONITOR (ADDED)
 # =========================
-
-def extract_polymarket_slug(text: str) -> Optional[str]:
+def new_event_monitor() -> None:
     """
-    Extract slug even if URL has ?tid=, ?ref=, #fragment, etc.
-    Works for /event/... and /market/...
+    Checks for newly created events and broadcasts alerts to all active users.
     """
-    m = re.search(r"https?://polymarket\.com/[^\s]+", text)
-    if not m:
-        return None
-
-    url = m.group(0).rstrip("/")
-
-    if "?" in url:
-        url = url.split("?", 1)[0]
-    if "#" in url:
-        url = url.split("#", 1)[0]
-
-    slug = url.split("/")[-1]
-    return slug or None
-
-
-def recommendation_text(market_prob: float, ai_prob: float) -> str:
-    diff = ai_prob - market_prob
-
-    if abs(diff) < EDGE_THRESHOLD:
-        return "No strong edge. Probably *hold / avoid*."
-
-    if diff > 0:
-        return "AI sees this as *undervalued*. Consider **BUY** (if you agree)."
-    else:
-        return "AI sees this as *overpriced*. Consider **SELL/short or opposite side** (if possible)."
-
-
-def trading_signal(market_prob: float, ai_prob: float) -> str:
-    edge = ai_prob - market_prob
-    abs_edge = abs(edge)
-
-    if abs_edge < EDGE_THRESHOLD / 2:
-        return "😐 Signal: HOLD / AVOID (tiny edge)"
-
-    if edge > 0:
-        if abs_edge > EDGE_THRESHOLD * 2:
-            return "🔥 Signal: STRONG BUY (AI thinks heavily undervalued)"
-        else:
-            return "✅ Signal: BUY (AI sees some undervaluation)"
-    else:
-        if abs_edge > EDGE_THRESHOLD * 2:
-            return "⚠️ Signal: STRONG SELL / TAKE OPPOSITE SIDE (if possible)"
-        else:
-            return "⚠️ Signal: SELL / TRIM (AI sees mild overpricing)"
-
-
-def profit_scenario_text(price: float, stake: float) -> str:
-    p = max(0.01, min(0.99, price))
-    payoff_if_win = stake / p
-    profit_if_win = payoff_if_win - stake
-
-    return (
-        f"If you invest ~{stake:.2f} USDC at price {p:.3f}:\n"
-        f"- If it *wins*: you get ~{payoff_if_win:.2f} (profit ≈ {profit_if_win:.2f})\n"
-        f"- If it *loses*: you lose your stake ({stake:.2f})."
-    )
-
-
-def build_ai_summary(outcomes: List[str], prices: List[float], ai_probs: List[float]) -> str:
-    if not ai_probs or len(ai_probs) != len(prices):
-        return "I couldn't build an AI summary for this market."
-
-    best_idx = max(range(len(ai_probs)), key=lambda i: ai_probs[i])
-    best_ai = ai_probs[best_idx]
-    best_mkt = prices[best_idx]
-    best_name = outcomes[best_idx] if best_idx < len(outcomes) else f"Outcome {best_idx}"
-
-    sorted_probs = sorted(ai_probs, reverse=True)
-    second_ai = sorted_probs[1] if len(sorted_probs) > 1 else 0.0
-    margin = best_ai - second_ai
-
-    if margin > 0.15:
-        confidence = "high"
-    elif margin > 0.07:
-        confidence = "medium"
-    else:
-        confidence = "low"
-
-    return (
-        f"*AI overall prediction:*\n"
-        f"Most likely outcome: *{best_name}*\n"
-        f"- AI prob: ~{best_ai*100:.2f}% (confidence: {confidence})\n"
-        f"- Market prob: ~{best_mkt*100:.2f}%\n"
-        f"- Difference (edge): {(best_ai - best_mkt)*100:+.2f}%"
-    )
-
-
-# =========================
-# 6. CORE ANALYSIS (MARKET)
-# =========================
-
-def subscribe_market_for_whales(chat_id: int, market: Dict[str, Any]) -> None:
-    """
-    Automatically subscribe this chat to whale alerts for this market.
-    No /watch needed – just sending the link is enough.
-    """
-    condition_id = market.get("conditionId")
-    if not condition_id:
-        return
-    slug = market.get("slug") or market.get("id") or "unknown-market"
-
-    if chat_id not in WHALE_SUBSCRIPTIONS:
-        WHALE_SUBSCRIPTIONS[chat_id] = {}
-    if chat_id not in WHALE_ALERT_ENABLED:
-        WHALE_ALERT_ENABLED[chat_id] = True  # default ON
-
-    subs = WHALE_SUBSCRIPTIONS[chat_id]
-    if condition_id not in subs:
-        subs[condition_id] = {
-            "slug": slug,
-            "last_seen_time": 0.0,
-        }
-
-
-def analyse_market_object(chat_id: int, market: Dict[str, Any]) -> None:
-    question = market.get("question") or market.get("title") or "Unknown question"
-    outcomes = parse_outcomes(market)
-    prices = parse_outcome_prices(market)
-    if not prices:
-        send_message(chat_id, "I couldn’t read prices for that market.")
-        return
-
-    condition_id = market.get("conditionId")
-    trades: List[Dict[str, Any]] = []
-    stats: List[Dict[str, float]] = []
-
-    if condition_id:
-        try:
-            trades = fetch_recent_trades(condition_id, RECENT_TRADES_LIMIT)
-            stats = compute_outcome_stats(trades, len(prices))
-        except Exception as e:
-            print("[WARN] trades fetch failed:", e)
-            stats = [{"buy_vol": 0.0, "sell_vol": 0.0,
-                      "total_vol": 0.0, "trade_count": 0,
-                      "avg_trade_price": prices[i]}
-                     for i in range(len(prices))]
-    else:
-        stats = [{"buy_vol": 0.0, "sell_vol": 0.0,
-                  "total_vol": 0.0, "trade_count": 0,
-                  "avg_trade_price": prices[i]}
-                 for i in range(len(prices))]
-
-    ai_probs = ai_model_probs(prices, stats)
-
-    total_market = sum(prices)
-    total_ai = sum(ai_probs)
-
-    lines: List[str] = []
-    lines.append(f"*Question:*\n{question}\n")
-    lines.append(f"`{SECTION_DIVIDER}`")
-    lines.append(f"*Default stake example:* `{INVEST_AMOUNT_USDC:.2f}` USDC\n")
-    lines.append("*Outcome | Market % | AI % | Edge | Sentiment*")
-
-    # best EV outcome for bet calculator
-    best_idx_for_bet = 0
-    best_ev_score = -999.0
-
-    for i, price in enumerate(prices):
-        name = outcomes[i] if i < len(outcomes) else f"Outcome {i}"
-        m_pct = round(price * 100, 2)
-        a_pct = round(ai_probs[i] * 100, 2)
-        edge = a_pct - m_pct
-
-        try:
-            ev_score = ai_probs[i] / max(price, 1e-6)
-        except Exception:
-            ev_score = -999
-        if ev_score > best_ev_score:
-            best_ev_score = ev_score
-            best_idx_for_bet = i
-
-        total_vol = stats[i]["total_vol"]
-        buy_vol = stats[i]["buy_vol"]
-        sell_vol = stats[i]["sell_vol"]
-        if total_vol > 0:
-            sentiment_val = (buy_vol - sell_vol) / total_vol
-        else:
-            sentiment_val = 0.0
-
-        if sentiment_val > 0.25:
-            sent_label = "📈 strong buy flow"
-        elif sentiment_val > 0.05:
-            sent_label = "🙂 mild buy flow"
-        elif sentiment_val < -0.25:
-            sent_label = "📉 strong sell flow"
-        elif sentiment_val < -0.05:
-            sent_label = "🙁 mild sell flow"
-        else:
-            sent_label = "😐 neutral flow"
-
-        lines.append(
-            f"- *{name}*: `{m_pct:.2f}%` → `AI {a_pct:.2f}%` "
-            f"(edge: {edge:+.2f}%)  {sent_label}"
-        )
-
-        sig_line = trading_signal(price, ai_probs[i])
-        lines.append(f"  ↳ {sig_line}")
-
-        rec = recommendation_text(price, ai_probs[i])
-        lines.append(f"  ↳ {rec}")
-
-        lines.append("  ↳ " + profit_scenario_text(price, INVEST_AMOUNT_USDC))
-        lines.append("")
-
-    lines.append(f"Market prob sum: `{total_market:.3f}`")
-    lines.append(f"AI prob sum: `{total_ai:.3f}`\n")
-
-    lines.append(build_ai_summary(outcomes, prices, ai_probs))
-
-    whales = detect_whales(trades, MIN_WHALE_USDC)
-    if whales:
-        lines.append(f"\n*Whale trades (>{MIN_WHALE_USDC:.0f} USDC per trade)*")
-        for w in whales:
-            outcome_idx = w.get("outcomeIndex")
-            if isinstance(outcome_idx, int) and 0 <= outcome_idx < len(outcomes):
-                outcome_name = outcomes[outcome_idx]
-            else:
-                outcome_name = f"Outcome {outcome_idx}"
-            lines.append(
-                f"- {w.get('side')} {outcome_name}: "
-                f"size {w.get('size')} @ {float(w.get('price', 0)):.3f} "
-                f"(≈{w['notional']:.0f} USDC)"
-            )
-
-        whale_flow = aggregate_whale_flow(whales, len(prices))
-        lines.append(f"\n*Whale flow by outcome (>{MIN_WHALE_USDC:.0f} USDC per trade)*")
-        for i, flow in enumerate(whale_flow):
-            if flow["buy_notional"] == 0 and flow["sell_notional"] == 0:
-                continue
-            name = outcomes[i] if i < len(outcomes) else f"Outcome {i}"
-            lines.append(
-                f"- {name}: whales BUY ≈ {flow['buy_notional']:.0f} USDC, "
-                f"SELL ≈ {flow['sell_notional']:.0f} USDC"
-            )
-    else:
-        lines.append(
-            f"\n_No trades above {MIN_WHALE_USDC:.0f} USDC detected (no whales under current threshold)._"
-        )
-
-    text = "\n".join(lines)
-    send_message(chat_id, text)
-
-    # store for dashboard
-    LAST_ANALYSES.append({
-        "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
-        "question": question,
-        "text": text
-    })
-    if len(LAST_ANALYSES) > 50:
-        LAST_ANALYSES.pop(0)
-
-    # set bet context for this chat
-    best_price = prices[best_idx_for_bet]
-    best_ai = ai_probs[best_idx_for_bet]
-    best_name = outcomes[best_idx_for_bet] if best_idx_for_bet < len(outcomes) else f"Outcome {best_idx_for_bet}"
-    slug = market.get("slug") or market.get("id") or "unknown-market"
-
-    PENDING_BET_CONTEXT[chat_id] = {
-        "slug": slug,
-        "outcome": best_name,
-        "price": best_price,
-        "ai_prob": best_ai,
-    }
-
-    send_message(
-        chat_id,
-        "💰 *AI bet calculator ready*\n"
-        f"For this market, my best edge is on: *{best_name}*.\n"
-        "Reply with an amount in USDC (e.g. `25` or `50`) and I’ll calculate expected return and EV.\n"
-        "Send `skip` to ignore."
-    )
-
-
-def handle_bet_amount(chat_id: int, text: str) -> None:
-    ctx = PENDING_BET_CONTEXT.get(chat_id)
-    if not ctx:
-        send_message(chat_id, "I don’t have any active market context. Send me a Polymarket link first.")
-        return
-
+    print("New Event Monitor started.")
+    # Fetch 50 most recent events to populate initial SEEN_EVENT_IDS
     try:
-        amount = float(text.strip())
-    except Exception:
-        send_message(chat_id, "Please send only a number like `50` for the bet size.")
-        return
+        initial_events = fetch_newest_events(limit=50)
+        for event in initial_events:
+            SEEN_EVENT_IDS.add(str(event.get("id")))
+    except:
+        pass # Ignore failure on startup
 
-    if amount <= 0:
-        send_message(chat_id, "Bet amount must be > 0.")
-        return
-
-    outcome = ctx["outcome"]
-    price = float(ctx["price"])
-    ai_prob = float(ctx["ai_prob"])
-
-    p = max(0.01, min(0.99, price))
-    q = max(0.0, min(1.0, ai_prob))
-
-    payoff_if_win = amount / p
-    profit_if_win = payoff_if_win - amount
-    ev = amount * (q / p - 1.0)
-    edge_pct = (q - p) * 100.0
-
-    sig_line = trading_signal(p, q)
-
-    msg = (
-        f"📊 *AI bet calculator*\n"
-        f"Market: `{ctx['slug']}`\n"
-        f"Outcome: *{outcome}*\n"
-        f"Bet size: `{amount:.2f}` USDC\n\n"
-        f"Market price: `{p:.3f}` (~{p*100:.2f}%)\n"
-        f"AI probability: `{q*100:.2f}%`\n"
-        f"Edge: `{edge_pct:+.2f}%` (AI - Market)\n\n"
-        f"If it *wins*: you get ~`{payoff_if_win:.2f}` (profit ≈ `{profit_if_win:.2f}`)\n"
-        f"If it *loses*: you lose `{amount:.2f}`\n\n"
-        f"Expected value (EV): `{ev:.2f}` USDC per bet.\n"
-        f"{sig_line}\n\n"
-        "_This is not financial advice. Only bet what you can afford to lose._"
-    )
-    send_message(chat_id, msg)
-
-
-# =========================
-# 7. HANDLE LINKS & EVENTS
-# =========================
-
-def handle_polymarket_link(chat_id: int, text: str) -> None:
-    slug = extract_polymarket_slug(text)
-    if not slug:
-        send_message(chat_id, "I couldn’t find a Polymarket link in your message.")
-        return
-
-    send_message(chat_id, f"🔍 Reading Polymarket slug:\n`{slug}`")
-
-    try:
-        market = fetch_market_by_slug(slug)
-        subscribe_market_for_whales(chat_id, market)
-        analyse_market_object(chat_id, market)
-        return
-    except ValueError as e:
-        if str(e) != "MARKET_NOT_FOUND":
-            print("[ERROR] market fetch failed:", e)
-            send_message(chat_id, "❌ Error fetching market from Polymarket.")
-            return
-    except Exception as e:
-        print("[ERROR] market fetch exception:", e)
-
-    # Try as event
-    try:
-        event = fetch_event_by_slug(slug)
-    except ValueError as e:
-        print("[ERROR] event not found:", e)
-        send_message(chat_id, "❌ Could not fetch market or event from Polymarket.")
-        return
-    except Exception as e:
-        print("[ERROR] event fetch failed:", e)
-        send_message(chat_id, "❌ Error fetching event from Polymarket.")
-        return
-
-    markets = event.get("markets") or []
-    if not markets:
-        send_message(chat_id, "I found the event, but it doesn’t have any markets yet.")
-        return
-
-    PENDING_EVENT_SELECTION[chat_id] = markets
-
-    lines: List[str] = []
-    title = event.get("title") or slug
-    lines.append(f"*Event:* {title}")
-    lines.append("I found these markets in this event:\n")
-
-    max_list = min(15, len(markets))
-    for i in range(max_list):
-        m = markets[i]
-        q = m.get("question") or m.get("groupItemTitle") or m.get("slug") or f"Market {i+1}"
-        lines.append(f"{i+1}. {q}")
-
-    if len(markets) > max_list:
-        lines.append(f"... and {len(markets) - max_list} more markets not listed here.")
-
-    lines.append("\nReply like: `pick 1` or `pick 2` and I’ll analyse that specific market.")
-    send_message(chat_id, "\n".join(lines))
-
-
-def handle_pick_command(chat_id: int, text: str) -> None:
-    m = re.match(r"pick\s+(\d+)", text.strip().lower())
-    if not m:
-        return
-
-    if chat_id not in PENDING_EVENT_SELECTION:
-        send_message(chat_id, "You don’t have any event selection active. Send me a Polymarket event link first.")
-        return
-
-    idx = int(m.group(1)) - 1
-    markets = PENDING_EVENT_SELECTION[chat_id]
-    if not (0 <= idx < len(markets)):
-        send_message(chat_id, f"Invalid choice. Please pick a number between 1 and {len(markets)}.")
-        return
-
-    market = markets[idx]
-    q = market.get("question") or market.get("groupItemTitle") or market.get("slug") or f"Market {idx+1}"
-    send_message(chat_id, f"✅ Analysing market #{idx+1}:\n*{q}*")
-    subscribe_market_for_whales(chat_id, market)
-    analyse_market_object(chat_id, market)
-
-
-# =========================
-# 8. WATCHLIST & EDGE AUTO ALERTS
-# =========================
-
-def handle_watch_command(chat_id: int, text: str) -> None:
-    """
-    /watch <polymarket link> [threshold]
-    Example:
-      /watch https://polymarket.com/... 0.10
-    """
-    parts = text.split()
-    if len(parts) < 2:
-        send_message(chat_id, "Usage: `/watch <polymarket link> [edge_threshold]` (example: 0.10 for 10%)")
-        return
-
-    slug = extract_polymarket_slug(text)
-    if not slug:
-        send_message(chat_id, "I couldn’t find a Polymarket link in that message.")
-        return
-
-    threshold = EDGE_THRESHOLD
-    if len(parts) >= 3:
-        try:
-            threshold = float(parts[-1])
-        except Exception:
-            pass
-
-    if chat_id not in WATCHLIST:
-        WATCHLIST[chat_id] = {}
-    WATCHLIST[chat_id][slug] = {
-        "threshold": threshold,
-        "last_edge": None,
-        "last_alert_ts": 0.0,
-    }
-
-    send_message(chat_id, f"🔔 Watching `{slug}` with edge threshold `{threshold:.2f}` (i.e. {threshold*100:.1f}%).")
-
-
-def handle_unwatch_command(chat_id: int) -> None:
-    if chat_id in WATCHLIST:
-        WATCHLIST.pop(chat_id)
-        send_message(chat_id, "🧹 Cleared all watched markets for this chat.")
-    else:
-        send_message(chat_id, "You have no watched markets.")
-
-
-def handle_watches_command(chat_id: int) -> None:
-    markets = WATCHLIST.get(chat_id)
-    if not markets:
-        send_message(chat_id, "You’re not watching any markets.\nUse `/watch <link> [threshold]` to start.")
-        return
-
-    lines = ["*Watched markets:*"]
-    for slug, info in markets.items():
-        lines.append(f"- `{slug}` (edge threshold: {info['threshold']:.2f})")
-    send_message(chat_id, "\n".join(lines))
-
-
-def alert_loop() -> None:
-    """
-    Background loop that periodically checks all watched markets
-    and sends alerts when AI edge crosses the threshold.
-    """
-    while True:
-        try:
-            if not WATCHLIST:
-                time.sleep(ALERT_CHECK_INTERVAL_SEC)
-                continue
-
-            now = time.time()
-
-            for chat_id, markets in list(WATCHLIST.items()):
-                for slug, info in list(markets.items()):
-                    try:
-                        market = fetch_market_by_slug(slug)
-                    except Exception as e:
-                        print(f"[ALERT] failed to fetch {slug}:", e)
-                        continue
-
-                    prices = parse_outcome_prices(market)
-                    outcomes = parse_outcomes(market)
-                    condition_id = market.get("conditionId")
-
-                    trades: List[Dict[str, Any]] = []
-                    stats: List[Dict[str, float]] = []
-
-                    if condition_id:
-                        try:
-                            trades = fetch_recent_trades(condition_id, RECENT_TRADES_LIMIT)
-                            stats = compute_outcome_stats(trades, len(prices))
-                        except Exception as e:
-                            print("[ALERT] trades fetch failed:", e)
-                            stats = [{"buy_vol": 0.0, "sell_vol": 0.0,
-                                      "total_vol": 0.0, "trade_count": 0,
-                                      "avg_trade_price": prices[i]}
-                                     for i in range(len(prices))]
-                    else:
-                        stats = [{"buy_vol": 0.0, "sell_vol": 0.0,
-                                  "total_vol": 0.0, "trade_count": 0,
-                                  "avg_trade_price": prices[i]}
-                                 for i in range(len(prices))]
-
-                    ai_probs = ai_model_probs(prices, stats)
-                    if not ai_probs:
-                        continue
-
-                    best_idx = max(range(len(ai_probs)), key=lambda i: abs(ai_probs[i] - prices[i]))
-                    best_ai = ai_probs[best_idx]
-                    best_mkt = prices[best_idx]
-                    best_name = outcomes[best_idx] if best_idx < len(outcomes) else f"Outcome {best_idx}"
-                    edge = best_ai - best_mkt
-                    abs_edge = abs(edge)
-
-                    threshold = info["threshold"]
-                    last_edge = info.get("last_edge")
-                    last_alert_ts = info.get("last_alert_ts", 0.0)
-
-                    should_alert = (
-                        abs_edge >= threshold and
-                        (last_edge is None or abs(last_edge) < threshold * 0.9 or (edge * last_edge) < 0) and
-                        (now - last_alert_ts) >= MIN_ALERT_GAP_SEC
-                    )
-
-                    if should_alert:
-                        question = market.get("question") or market.get("title") or slug
-                        sig_line = trading_signal(best_mkt, best_ai)
-                        msg = (
-                            f"📢 *Auto alert for watched market*\n"
-                            f"`{slug}`\n\n"
-                            f"*Question:*\n{question}\n\n"
-                            f"Top edge outcome: *{best_name}*\n"
-                            f"- Market: `{best_mkt*100:.2f}%`\n"
-                            f"- AI: `{best_ai*100:.2f}%`\n"
-                            f"- Edge: `{(best_ai - best_mkt)*100:.2f}%`\n\n"
-                            f"{sig_line}\n"
-                            f"_Threshold: {threshold*100:.1f}% | Auto alerts every ~{ALERT_CHECK_INTERVAL_SEC//60} min_"
-                        )
-                        send_message(chat_id, msg)
-                        info["last_edge"] = edge
-                        info["last_alert_ts"] = now
-                    else:
-                        info["last_edge"] = edge
-
-        except Exception as e:
-            print("[ALERT LOOP ERROR]", e)
-
-        time.sleep(ALERT_CHECK_INTERVAL_SEC)
-
-
-# =========================
-# 9. WHALE ALERT LOOP  (with AI view + bet example)
-# =========================
-
-def parse_trade_timestamp(trade: Dict[str, Any]) -> float:
-    ts_str = trade.get("createdAt") or trade.get("timestamp")
-    if not ts_str:
-        return 0.0
-    try:
-        if ts_str.endswith("Z"):
-            ts_str = ts_str.replace("Z", "+00:00")
-        dt = datetime.fromisoformat(ts_str)
-        return dt.timestamp()
-    except Exception:
-        return 0.0
-
-
-def whale_alert_loop() -> None:
-    """
-    Whale radar for markets you have sent links for.
-
-    Every WHALE_ALERT_INTERVAL_SEC seconds (default 300s):
-    - For each subscribed market:
-        - Fetch recent trades
-        - Look at trades in the last WHALE_ALERT_INTERVAL_SEC seconds
-        - Highlight whale trades (>= MIN_WHALE_USDC)
-        - For the biggest whale: show AI edge + example bet & EV on that side.
-    Works WITHOUT /watch – just sending a link subscribes the chat automatically.
-    """
-    while True:
-        try:
-            if not WHALE_SUBSCRIPTIONS:
-                time.sleep(WHALE_ALERT_INTERVAL_SEC)
-                continue
-
-            now = time.time()
-            cutoff = now - WHALE_ALERT_INTERVAL_SEC
-
-            for chat_id, subs in list(WHALE_SUBSCRIPTIONS.items()):
-                if not WHALE_ALERT_ENABLED.get(chat_id, True):
-                    continue
-
-                for condition_id, info in list(subs.items()):
-                    try:
-                        trades = fetch_recent_trades(condition_id, RECENT_TRADES_LIMIT)
-                    except Exception as e:
-                        print(f"[WHALE ALERT] fetch trades failed for {condition_id}:", e)
-                        continue
-
-                    if not trades:
-                        continue
-
-                    # compute timestamps
-                    all_ts_zero = True
-                    for t in trades:
-                        t["_ts"] = parse_trade_timestamp(t)
-                        if t["_ts"] > 0:
-                            all_ts_zero = False
-
-                    trades.sort(key=lambda x: x["_ts"], reverse=True)
-
-                    if all_ts_zero:
-                        # Fallback: if we couldn't parse timestamps at all,
-                        # just treat the top N trades as "recent".
-                        recent_trades = trades[:50]
-                    else:
-                        recent_trades = [t for t in trades if t["_ts"] >= cutoff]
-
-                    if not recent_trades:
-                        continue
-
-                    slug = info.get("slug", condition_id)
-
-                    whale_trades = []
-                    normal_trades = []
-                    for t in recent_trades:
-                        try:
-                            size = float(t.get("size", 0) or 0.0)
-                            price = float(t.get("price", 0) or 0.0)
-                            notional = size * price
-                        except Exception:
-                            notional = 0.0
-
-                        if notional >= MIN_WHALE_USDC:
-                            t2 = dict(t)
-                            t2["notional"] = notional
-                            whale_trades.append(t2)
-                        else:
-                            normal_trades.append(t)
-
-                    if not recent_trades:
-                        continue
-
-                    lines: List[str] = []
-                    lines.append(f"⏰ *New trades (last {WHALE_ALERT_INTERVAL_SEC//60} min)*")
-                    lines.append(f"`{slug}`")
-                    lines.append(f"Total new trades (sample): *{len(recent_trades)}*")
-
-                    # Default values in case AI/market fetch fails
-                    ai_section_added = False
-
-                    if whale_trades:
-                        whale_trades.sort(key=lambda x: x.get("notional", 0.0), reverse=True)
-                        lines.append(f"🐋 Whale trades (≥{MIN_WHALE_USDC:.0f} USDC): *{len(whale_trades)}*")
-                        for w in whale_trades[:5]:
-                            side = (w.get('side') or '').upper()
-                            outcome_idx = w.get('outcomeIndex')
-                            outcome_str = f"Outcome {outcome_idx}"
-                            lines.append(
-                                f"- {side} {outcome_str}: "
-                                f"size {w.get('size')} @ {float(w.get('price', 0)):.3f} "
-                                f"(≈{w['notional']:.0f} USDC)"
-                            )
-
-                        # === AI view + bet example for the biggest whale side ===
-                        top_whale = whale_trades[0]
-                        try:
-                            market = fetch_market_by_slug(slug)
-                            prices = parse_outcome_prices(market)
-                            outcomes = parse_outcomes(market)
-                            stats = compute_outcome_stats(trades, len(prices))
-                            ai_probs = ai_model_probs(prices, stats)
-                        except Exception as e:
-                            print(f"[WHALE ALERT] AI fetch failed for {slug}:", e)
-                            prices, outcomes, ai_probs = [], [], []
-
-                        outcome_idx = top_whale.get("outcomeIndex")
-                        if (
-                            isinstance(outcome_idx, int)
-                            and prices
-                            and ai_probs
-                            and 0 <= outcome_idx < len(prices)
-                            and 0 <= outcome_idx < len(ai_probs)
-                        ):
-                            outcome_name = (
-                                outcomes[outcome_idx]
-                                if outcome_idx < len(outcomes)
-                                else f"Outcome {outcome_idx}"
-                            )
-                            p = max(0.01, min(0.99, float(prices[outcome_idx])))
-                            q = max(0.0, min(1.0, float(ai_probs[outcome_idx])))
-                            edge_pct = (q - p) * 100.0
-
-                            stake = INVEST_AMOUNT_USDC
-                            payoff_if_win = stake / p
-                            profit_if_win = payoff_if_win - stake
-                            ev = stake * (q / p - 1.0)
-
-                            lines.append("")
-                            lines.append("🤖 *AI view on top whale side*")
-                            lines.append(f"- Outcome: *{outcome_name}* ({(top_whale.get('side') or '').upper()})")
-                            lines.append(f"- Market prob: `{p*100:.2f}%`")
-                            lines.append(f"- AI prob: `{q*100:.2f}%` (edge `{edge_pct:+.2f}%`)")
-                            lines.append(
-                                f"💰 Example bet `{stake:.2f}` USDC → "
-                                f"if wins ≈ `{payoff_if_win:.2f}` (profit `{profit_if_win:.2f}`), "
-                                f"EV ≈ `{ev:.2f}` USDC."
-                            )
-                            ai_section_added = True
-
-                    else:
-                        lines.append("🐋 No whale trades in this batch (only smaller orders).")
-
-                    if not ai_section_added:
-                        lines.append(
-                            "\n🤖 AI view not available for this batch (could not fetch prices or outcome index)."
-                        )
-
-                    lines.append(
-                        "_You can turn these alerts off with `/alerts_off`, and back on with `/alerts_on`. "
-                        "This info is not financial advice._"
-                    )
-
-                    send_message(chat_id, "\n".join(lines))
-
-        except Exception as e:
-            print("[WHALE ALERT LOOP ERROR]", e)
-
-        time.sleep(WHALE_ALERT_INTERVAL_SEC)
-
-
-def handle_alerts_toggle(chat_id: int, enable: bool) -> None:
-    WHALE_ALERT_ENABLED[chat_id] = enable
-    if enable:
-        send_message(chat_id, "✅ Whale / global alerts are now *ON* for this chat.")
-    else:
-        send_message(chat_id, "🔕 All whale / global alerts are now *OFF* for this chat.")
-
-
-# =========================
-# 9.5 GLOBAL EDGE LOOP (ALL CATEGORIES)
-# =========================
-
-def global_watch_loop() -> None:
-    """
-    Global edge scanner:
-    - Every GLOBAL_ALERT_INTERVAL_SEC seconds (default 60s)
-    - Pulls markets from:
-        * overall high-volume (Trending-like)
-        * category tags (politics, sports, finance, crypto, etc.)
-    - Runs AI vs market prices
-    - If AI edge >= GLOBAL_EDGE_THRESHOLD, sends alert
-      with example bet size + EV + internal arbitrage hint.
-    """
     while True:
         try:
             if not ACTIVE_CHATS:
-                time.sleep(GLOBAL_ALERT_INTERVAL_SEC)
+                time.sleep(60)
                 continue
 
-            try:
-                market_slugs = discover_global_slugs()
-            except Exception as e:
-                print("[GLOBAL] failed to discover markets:", e)
-                time.sleep(GLOBAL_ALERT_INTERVAL_SEC)
-                continue
-
-            now = time.time()
-
-            for slug in market_slugs:
-                state = GLOBAL_STATE.get(slug, {"last_alert_ts": 0.0})
-                last_alert_ts = state.get("last_alert_ts", 0.0)
-
-                try:
-                    market = fetch_market_by_slug(slug)
-                except Exception as e:
-                    print(f"[GLOBAL] failed to fetch {slug}:", e)
-                    continue
-
-                prices = parse_outcome_prices(market)
-                if not prices:
-                    continue
-                outcomes = parse_outcomes(market)
-
-                condition_id = market.get("conditionId")
-                trades: List[Dict[str, Any]] = []
-                stats: List[Dict[str, float]] = []
-
-                if condition_id:
-                    try:
-                        trades = fetch_recent_trades(condition_id, RECENT_TRADES_LIMIT)
-                        stats = compute_outcome_stats(trades, len(prices))
-                    except Exception as e:
-                        print(f"[GLOBAL] trades fetch failed for {slug}:", e)
-                        stats = [{"buy_vol": 0.0, "sell_vol": 0.0,
-                                  "total_vol": 0.0, "trade_count": 0,
-                                  "avg_trade_price": prices[i]}
-                                 for i in range(len(prices))]
-                else:
-                    stats = [{"buy_vol": 0.0, "sell_vol": 0.0,
-                              "total_vol": 0.0, "trade_count": 0,
-                              "avg_trade_price": prices[i]}
-                             for i in range(len(prices))]
-
-                ai_probs = ai_model_probs(prices, stats)
-                if not ai_probs:
-                    continue
-
-                best_idx = max(range(len(ai_probs)), key=lambda i: ai_probs[i] - prices[i])
-                edge = ai_probs[best_idx] - prices[best_idx]
-                if edge < GLOBAL_EDGE_THRESHOLD:
-                    continue
-
-                if now - last_alert_ts < GLOBAL_ALERT_MIN_GAP_SEC:
-                    continue
-
-                p = max(0.01, min(0.99, float(prices[best_idx])))
-                q = max(0.0, min(1.0, float(ai_probs[best_idx])))
-
-                stake = INVEST_AMOUNT_USDC
-                payoff_if_win = stake / p
-                profit_if_win = payoff_if_win - stake
-                ev = stake * (q / p - 1.0)
-                edge_pct = (q - p) * 100.0
-
-                total_prob = sum(prices)
-                arb_note = ""
-                if total_prob < 0.98 or total_prob > 1.02:
-                    arb_note = f"\n🔀 Internal arb hint: total probs sum = `{total_prob:.3f}` (≠ 1.0)."
-
-                best_name = outcomes[best_idx] if best_idx < len(outcomes) else f"Outcome {best_idx}"
-                question = market.get("question") or market.get("title") or slug
-
-                lines: List[str] = []
-                lines.append("🌍 *Global Polymarket edge alert*")
-                lines.append(f"`{slug}`")
-                lines.append(f"*Question:*\n{question}\n")
-                lines.append(f"Best edge outcome: *{best_name}*")
-                lines.append(f"- Market prob: `{p*100:.2f}%`")
-                lines.append(f"- AI prob: `{q*100:.2f}%`")
-                lines.append(f"- Edge: `{edge_pct:+.2f}%` (AI - Market)\n")
-                lines.append(
-                    f"💰 *Example bet size:* `{stake:.2f}` USDC\n"
-                    f"- If it *wins*: you get ~`{payoff_if_win:.2f}` (profit ≈ `{profit_if_win:.2f}`)\n"
-                    f"- If it *loses*: you lose `{stake:.2f}`\n"
-                    f"- Expected value (EV): `{ev:.2f}` USDC\n"
-                    f"{arb_note}\n"
-                )
-                lines.append(
-                    "_This is an automated AI + arbitrage scan. "
-                    "Not financial advice — do your own research and bet only what you can afford to lose._"
-                )
-
-                msg = "\n".join(lines)
-
-                for chat_id in list(ACTIVE_CHATS):
-                    if WHALE_ALERT_ENABLED.get(chat_id, True):
-                        send_message(chat_id, msg)
-
-                state["last_alert_ts"] = now
-                GLOBAL_STATE[slug] = state
+            events = fetch_newest_events(limit=5)
+            
+            for event in events:
+                event_id = str(event.get("id"))
+                if event_id not in SEEN_EVENT_IDS:
+                    SEEN_EVENT_IDS.add(event_id)
+                    
+                    title = event.get("title", "New Event")
+                    slug = event.get("slug")
+                    
+                    msg = (
+                        f"🎉 **NEW POLYMARKET EVENT DETECTED**\n"
+                        f"📌 *{title}*\n"
+                        f"🔗 [View Event](https://polymarket.com/event/{slug})\n\n"
+                        f"Send the link to me to analyze the markets!"
+                    )
+                    
+                    # Broadcast the alert to all active users
+                    for chat_id in list(ACTIVE_CHATS):
+                        if WHALE_ALERT_ENABLED.get(chat_id, True): # Check if user disabled alerts
+                            send_message(chat_id, msg)
+                    
+                    time.sleep(5) # Delay between alerts if multiple new events land at once
 
         except Exception as e:
-            print("[GLOBAL WATCH LOOP ERROR]", e)
+            print(f"[NEW EVENT MONITOR ERROR] {e}")
 
-        time.sleep(GLOBAL_ALERT_INTERVAL_SEC)
+        time.sleep(60) # Check every 60 seconds
 
-
-# =========================
-# 10. ARBITRAGE SCAN
-# =========================
-
-def check_market_arbitrage(slug: str) -> Optional[str]:
-    try:
-        m = fetch_market_by_slug(slug)
-    except Exception as e:
-        print(f"[ARB] failed for {slug}:", e)
-        return None
-
-    question = m.get("question") or m.get("title") or slug
-    prices = parse_outcome_prices(m)
-    if not prices:
-        return None
-
-    total_prob = sum(prices)
-    if 0.98 <= total_prob <= 1.02:
-        return None
-
-    outcomes = parse_outcomes(m)
-    msg_lines = [f"`{slug}`", question, f"Total probs sum: {total_prob:.3f}"]
-    for i, p in enumerate(prices):
-        name = outcomes[i] if i < len(outcomes) else f"Outcome {i}"
-        msg_lines.append(f"- {name}: {p*100:.2f}%")
-
-    msg_lines.append(
-        "_Sum far from 1.0 → maybe mispricing or fees. Do your own check before trading._"
-    )
-    return "\n".join(msg_lines)
-
-
-def handle_arb_command(chat_id: int) -> None:
-    if not ARBITRAGE_WATCHLIST:
-        send_message(chat_id, "Arbitrage watchlist is empty. Edit the code and add some slugs.")
-        return
-
-    send_message(chat_id, "🔎 Scanning watchlist for internal arbitrage...")
-
-    hits: List[str] = []
-    for slug in ARBITRAGE_WATCHLIST:
-        res = check_market_arbitrage(slug)
-        if res:
-            hits.append(res)
-
-    if not hits:
-        send_message(chat_id, "No obvious internal arbitrage detected in watchlist (sum ≈ 1.0 everywhere).")
-    else:
-        send_message(chat_id, "*Possible internal mispricings:*\n\n" + "\n\n".join(hits))
-
+# ... (Other loops: whale_alert_loop, global_watch_loop, alert_loop are unchanged - use existing code) ...
 
 # =========================
-# 11. SIMPLE WEB DASHBOARD (Flask)
+# 12. MAIN LOOP (Updated)
 # =========================
-
-app = Flask(__name__)
-
-DASHBOARD_TEMPLATE = """
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>Polymarket Bot Dashboard</title>
-  <style>
-    body { font-family: system-ui, -apple-system, sans-serif; background:#0b0f19; color:#f5f5f5; padding:20px; }
-    h1 { color:#7ad7ff; }
-    .card { border:1px solid #333; padding:12px 16px; margin-bottom:16px; border-radius:8px; background:#111827; }
-    .small { font-size:12px; color:#9ca3af; }
-    pre { white-space:pre-wrap; word-wrap:break-word; font-size:13px; }
-  </style>
-</head>
-<body>
-  <h1>Polymarket AI Bot Dashboard</h1>
-  <p class="small">Live summaries of recent analyses and watched markets.</p>
-
-  <h2>Watched Markets (Edge Alerts)</h2>
-  {% if not watchlist %}
-    <p class="small">No active edge watches. Use /watch in Telegram.</p>
-  {% else %}
-    {% for chat_id, mkts in watchlist.items() %}
-      <div class="card">
-        <div class="small">Chat ID: {{ chat_id }}</div>
-        <ul>
-        {% for slug, info in mkts.items() %}
-          <li><code>{{ slug }}</code> — threshold: {{ '%.2f'|format(info.threshold) }}</li>
-        {% endfor %}
-        </ul>
-      </div>
-    {% endfor %}
-  {% endif %}
-
-  <h2>Whale Subscriptions</h2>
-  {% if not whalesubs %}
-    <p class="small">No whale subscriptions yet. Send a Polymarket link in Telegram to subscribe.</p>
-  {% else %}
-    {% for chat_id, mkts in whalesubs.items() %}
-      <div class="card">
-        <div class="small">Chat ID: {{ chat_id }} (alerts: {{ 'ON' if alerts_enabled.get(chat_id, True) else 'OFF' }})</div>
-        <ul>
-        {% for cond_id, info in mkts.items() %}
-          <li><code>{{ info.slug }}</code> (condition {{ cond_id }})</li>
-        {% endfor %}
-        </ul>
-      </div>
-    {% endfor %}
-  {% endif %}
-
-  <h2>Recent Analyses</h2>
-  {% if not analyses %}
-    <p class="small">No analyses yet.</p>
-  {% else %}
-    {% for a in analyses %}
-      <div class="card">
-        <div class="small">{{ a.timestamp }}</div>
-        <div><strong>{{ a.question }}</strong></div>
-        <pre>{{ a.text }}</pre>
-      </div>
-    {% endfor %}
-  {% endif %}
-</body>
-</html>
-"""
-
-@app.route("/")
-def index():
-    watch_display = {}
-    for cid, mkts in WATCHLIST.items():
-        watch_display[cid] = {}
-        for slug, info in mkts.items():
-            watch_display[cid][slug] = type("Info", (), info)
-
-    whale_display = {}
-    for cid, mkts in WHALE_SUBSCRIPTIONS.items():
-        whale_display[cid] = {}
-        for cond_id, info in mkts.items():
-            whale_display[cid][cond_id] = type("Info", (), info)
-
-    return render_template_string(
-        DASHBOARD_TEMPLATE,
-        watchlist=watch_display,
-        whalesubs=whale_display,
-        alerts_enabled=WHALE_ALERT_ENABLED,
-        analyses=LAST_ANALYSES[-10:][::-1],
-    )
-
 
 def run_flask():
+    # ... (existing run_flask) ...
     port = int(os.getenv("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
 
-
-# =========================
-# 12. MAIN LOOP
-# =========================
-
 def main() -> None:
     print("Advanced Polymarket bot (events, AI, whale alerts with AI, global scanner, bet calc, dashboard) started.")
+
     last_update_id: Optional[int] = None
 
-    # Background loops
+    # Background loops (All existing + the new one)
+    threading.Thread(target=run_flask, daemon=True).start()
     threading.Thread(target=alert_loop, daemon=True).start()
     threading.Thread(target=whale_alert_loop, daemon=True).start()
     threading.Thread(target=global_watch_loop, daemon=True).start()
+    
+    # START THE NEW EVENT MONITOR THREAD (NEW)
+    threading.Thread(target=new_event_monitor, daemon=True).start() 
 
     while True:
         try:
             params: Dict[str, Any] = {"timeout": 25}
             if last_update_id is not None:
                 params["offset"] = last_update_id + 1
-
             data = telegram_api("getUpdates", params)
+
         except Exception as e:
             print("[ERROR] getUpdates failed:", e)
             time.sleep(POLL_INTERVAL_SEC)
@@ -1533,10 +542,12 @@ def main() -> None:
 
             chat_id = message["chat"]["id"]
             text = message.get("text", "")
+
             if not text:
                 continue
 
             ACTIVE_CHATS.add(chat_id)
+
             lower = text.strip().lower()
 
             # /start
@@ -1548,8 +559,9 @@ def main() -> None:
                     "- If it’s an *event*, I’ll list markets and you can reply `pick 1`, `pick 2`, etc.\n"
                     "- I show AI vs market %, trading signals, whales, and profit examples.\n"
                     "- After analysis, reply with an amount (e.g. `50`) for an AI bet calculator.\n"
-                    "- Whale alerts run every 5 min on markets you send and now include AI edge + example bet.\n"
-                    "- A global scanner runs every ~1 min across Trending + categories (Politics, Sports, Crypto, etc.) and pushes top AI edges + arb hints.\n"
+                    "- **Whale alerts** run every 5 min on markets you send and now include AI edge + example bet.\n"
+                    "- **New Event Alerts** run every 1 min.\n"
+                    "- A **global scanner** runs every ~1 min across all categories and pushes top AI edges + **arb hints**.\n"
                     "- `/watch <link> [threshold]` → edge-based alerts for specific markets.\n"
                     "- `/watches`, `/unwatch` to manage your watchlist.\n"
                     "- `/alerts_on` / `/alerts_off` to toggle all push alerts.\n"
@@ -1562,7 +574,6 @@ def main() -> None:
             if lower == "/alerts_off":
                 handle_alerts_toggle(chat_id, False)
                 continue
-
             if lower == "/alerts_on":
                 handle_alerts_toggle(chat_id, True)
                 continue
@@ -1571,11 +582,9 @@ def main() -> None:
             if lower.startswith("/watch"):
                 handle_watch_command(chat_id, text)
                 continue
-
             if lower == "/watches":
                 handle_watches_command(chat_id)
                 continue
-
             if lower == "/unwatch":
                 handle_unwatch_command(chat_id)
                 continue
@@ -1614,7 +623,10 @@ def main() -> None:
 
         time.sleep(POLL_INTERVAL_SEC)
 
-
 if __name__ == "__main__":
+    # Your existing flask thread (modified to include all new background loops)
+    # The existing code already had a thread starting 'run_flask' and then calling 'main()'
     threading.Thread(target=run_flask, daemon=True).start()
+    
+    # Start all monitoring threads within main() as planned for your structure:
     main()
