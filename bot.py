@@ -5,7 +5,7 @@ import math
 import os
 import threading
 from datetime import datetime
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Set
 
 import requests
 from flask import Flask, render_template_string
@@ -53,6 +53,9 @@ WHALE_SUBSCRIPTIONS: Dict[int, Dict[str, Dict[str, Any]]] = {}
 WHALE_ALERT_ENABLED: Dict[int, bool] = {}
 WHALE_ALERT_INTERVAL_SEC = 300  # 5 minutes
 
+# Track all chats that have ever talked to the bot
+ACTIVE_CHATS: Set[int] = set()
+
 # For bet calculator: context per chat
 # PENDING_BET_CONTEXT[chat_id] = { 'slug', 'outcome', 'price', 'ai_prob' }
 PENDING_BET_CONTEXT: Dict[int, Dict[str, Any]] = {}
@@ -60,6 +63,28 @@ PENDING_BET_CONTEXT: Dict[int, Dict[str, Any]] = {}
 # For pretty formatting and dashboard
 SECTION_DIVIDER = "────────────────────────"
 LAST_ANALYSES: List[Dict[str, Any]] = []  # store recent analyses for web UI
+
+# ========= Multiple Polymarket API keys (rotation) =========
+# Optional: set POLY_API_KEY_1, POLY_API_KEY_2, POLY_API_KEY_3 in env.
+POLYMARKET_API_KEYS: List[str] = [
+    os.getenv("POLY_API_KEY_1") or "",
+    os.getenv("POLY_API_KEY_2") or "",
+    os.getenv("POLY_API_KEY_3") or "",
+]
+POLYMARKET_API_KEYS = [k for k in POLYMARKET_API_KEYS if k]  # drop empties
+_API_KEY_INDEX = 0  # internal pointer for rotation
+
+# ========= Global watchlist edge scanner (push signals) =========
+# Add important Polymarket market slugs here:
+GLOBAL_WATCHLIST: List[str] = [
+    # "will-trump-win-the-2024-us-presidential-election",
+    # "will-bitcoin-reach-100k-by-2025",
+]
+GLOBAL_STATE: Dict[str, Dict[str, Any]] = {}
+GLOBAL_ALERT_INTERVAL_SEC = 60          # check every minute
+GLOBAL_EDGE_THRESHOLD = 0.08            # 8% AI edge
+GLOBAL_ALERT_MIN_GAP_SEC = 300          # min 5 min between alerts per market
+
 
 # =========================
 # 2. TELEGRAM HELPERS
@@ -94,9 +119,26 @@ def send_message(chat_id: int, text: str) -> None:
 # 3. POLYMARKET HELPERS
 # =========================
 
+def rotated_get(url: str, params: Dict[str, Any] = None, timeout: int = 10) -> requests.Response:
+    """
+    Wrapper around requests.get that rotates through multiple
+    Polymarket API keys (if provided) to reduce rate-limit risk.
+    """
+    global _API_KEY_INDEX
+    headers: Dict[str, str] = {}
+
+    if POLYMARKET_API_KEYS:
+        key = POLYMARKET_API_KEYS[_API_KEY_INDEX % len(POLYMARKET_API_KEYS)]
+        _API_KEY_INDEX += 1
+        # If Polymarket uses a different header, change this line.
+        headers["Authorization"] = f"Bearer {key}"
+
+    return requests.get(url, params=params, headers=headers, timeout=timeout)
+
+
 def fetch_market_by_slug(slug: str) -> Dict[str, Any]:
     url = f"{GAMMA_BASE}/markets/slug/{slug}"
-    resp = requests.get(url, timeout=10)
+    resp = rotated_get(url, timeout=10)
     if resp.status_code == 404:
         raise ValueError("MARKET_NOT_FOUND")
     resp.raise_for_status()
@@ -105,7 +147,7 @@ def fetch_market_by_slug(slug: str) -> Dict[str, Any]:
 
 def fetch_event_by_slug(slug: str) -> Dict[str, Any]:
     url = f"{GAMMA_BASE}/events/slug/{slug}"
-    resp = requests.get(url, timeout=10)
+    resp = rotated_get(url, timeout=10)
     if resp.status_code == 404:
         raise ValueError("EVENT_NOT_FOUND")
     resp.raise_for_status()
@@ -114,7 +156,7 @@ def fetch_event_by_slug(slug: str) -> Dict[str, Any]:
 
 def fetch_recent_trades(condition_id: str, limit: int = RECENT_TRADES_LIMIT) -> List[Dict[str, Any]]:
     params = {"limit": limit, "market": condition_id}
-    resp = requests.get(f"{DATA_BASE}/trades", params=params, timeout=10)
+    resp = rotated_get(f"{DATA_BASE}/trades", params=params, timeout=10)
     resp.raise_for_status()
     return resp.json()
 
@@ -601,7 +643,6 @@ def handle_bet_amount(chat_id: int, text: str) -> None:
     profit_if_win = payoff_if_win - amount
     ev = amount * (q / p - 1.0)  # expected profit (can be negative)
     edge_pct = (q - p) * 100.0
-    roi_if_win = profit_if_win / amount
 
     sig_line = trading_signal(p, q)
 
@@ -616,7 +657,8 @@ def handle_bet_amount(chat_id: int, text: str) -> None:
         f"If it *wins*: you get ~`{payoff_if_win:.2f}` (profit ≈ `{profit_if_win:.2f}`)\n"
         f"If it *loses*: you lose `{amount:.2f}`\n\n"
         f"Expected value (EV): `{ev:.2f}` USDC per bet.\n"
-        f"{sig_line}"
+        f"{sig_line}\n\n"
+        "_This is not financial advice. Only bet what you can afford to lose._"
     )
     send_message(chat_id, msg)
 
@@ -878,6 +920,8 @@ def parse_trade_timestamp(trade: Dict[str, Any]) -> float:
 
 def whale_alert_loop() -> None:
     """
+    Yes, add a GLOBAL_WATCHLIST scanner.
+
     Every 5 minutes, check all subscribed markets for new trades.
     If there are new trades since last check, send a summary.
     Highlight whale trades (>= MIN_WHALE_USDC).
@@ -982,6 +1026,127 @@ def handle_alerts_toggle(chat_id: int, enable: bool) -> None:
         send_message(chat_id, "✅ Whale / new trade alerts are now *ON* for markets you send.")
     else:
         send_message(chat_id, "🔕 Whale / new trade alerts are now *OFF*.")
+
+
+# =========================
+# 9.5 GLOBAL WATCHLIST EDGE LOOP (push live signals)
+# =========================
+
+def global_watch_loop() -> None:
+    """
+    Global edge scanner:
+    - Every GLOBAL_ALERT_INTERVAL_SEC seconds (default 60s)
+    - For each slug in GLOBAL_WATCHLIST:
+        - Fetch market + trades using rotated Polymarket APIs
+        - Run AI model vs market prices
+        - If edge >= GLOBAL_EDGE_THRESHOLD, push alert
+        - Include example bet size & EV using INVEST_AMOUNT_USDC
+    """
+    while True:
+        try:
+            if not GLOBAL_WATCHLIST or not ACTIVE_CHATS:
+                time.sleep(GLOBAL_ALERT_INTERVAL_SEC)
+                continue
+
+            now = time.time()
+
+            for slug in GLOBAL_WATCHLIST:
+                state = GLOBAL_STATE.get(slug, {"last_alert_ts": 0.0})
+                last_alert_ts = state.get("last_alert_ts", 0.0)
+
+                try:
+                    market = fetch_market_by_slug(slug)
+                except Exception as e:
+                    print(f"[GLOBAL] failed to fetch {slug}:", e)
+                    continue
+
+                prices = parse_outcome_prices(market)
+                if not prices:
+                    continue
+                outcomes = parse_outcomes(market)
+
+                condition_id = market.get("conditionId")
+                trades: List[Dict[str, Any]] = []
+                stats: List[Dict[str, float]] = []
+
+                if condition_id:
+                    try:
+                        trades = fetch_recent_trades(condition_id, RECENT_TRADES_LIMIT)
+                        stats = compute_outcome_stats(trades, len(prices))
+                    except Exception as e:
+                        print(f"[GLOBAL] trades fetch failed for {slug}:", e)
+                        stats = [{"buy_vol": 0.0, "sell_vol": 0.0,
+                                  "total_vol": 0.0, "trade_count": 0,
+                                  "avg_trade_price": prices[i]}
+                                 for i in range(len(prices))]
+                else:
+                    stats = [{"buy_vol": 0.0, "sell_vol": 0.0,
+                              "total_vol": 0.0, "trade_count": 0,
+                              "avg_trade_price": prices[i]}
+                             for i in range(len(prices))]
+
+                ai_probs = ai_model_probs(prices, stats)
+                if not ai_probs:
+                    continue
+
+                # best positive edge outcome
+                best_idx = max(
+                    range(len(ai_probs)),
+                    key=lambda i: ai_probs[i] - prices[i]
+                )
+                edge = ai_probs[best_idx] - prices[best_idx]
+                if edge < GLOBAL_EDGE_THRESHOLD:
+                    continue
+
+                # avoid spamming same market too often
+                if now - last_alert_ts < GLOBAL_ALERT_MIN_GAP_SEC:
+                    continue
+
+                p = max(0.01, min(0.99, float(prices[best_idx])))
+                q = max(0.0, min(1.0, float(ai_probs[best_idx])))
+                stake = INVEST_AMOUNT_USDC
+
+                payoff_if_win = stake / p
+                profit_if_win = payoff_if_win - stake
+                ev = stake * (q / p - 1.0)
+                edge_pct = (q - p) * 100.0
+
+                best_name = outcomes[best_idx] if best_idx < len(outcomes) else f"Outcome {best_idx}"
+                question = market.get("question") or market.get("title") or slug
+
+                lines: List[str] = []
+                lines.append("🌍 *Global Polymarket edge alert*")
+                lines.append(f"`{slug}`")
+                lines.append(f"*Question:*\n{question}\n")
+                lines.append(f"Best edge outcome: *{best_name}*")
+                lines.append(f"- Market prob: `{p*100:.2f}%`")
+                lines.append(f"- AI prob: `{q*100:.2f}%`")
+                lines.append(f"- Edge: `{edge_pct:+.2f}%` (AI - Market)\n")
+                lines.append(
+                    f"💰 *Example bet size:* `{stake:.2f}` USDC\n"
+                    f"- If it *wins*: you get ~`{payoff_if_win:.2f}` (profit ≈ `{profit_if_win:.2f}`)\n"
+                    f"- If it *loses*: you lose `{stake:.2f}`\n"
+                    f"- Expected value (EV): `{ev:.2f}` USDC\n"
+                )
+                lines.append(
+                    "_This is an automated example using a fixed stake. "
+                    "Do your own research and size bets based on your risk. Not financial advice._"
+                )
+
+                msg = "\n".join(lines)
+
+                for chat_id in list(ACTIVE_CHATS):
+                    # reuse same toggle: if alerts_off, they don't get global pushes
+                    if WHALE_ALERT_ENABLED.get(chat_id, True):
+                        send_message(chat_id, msg)
+
+                state["last_alert_ts"] = now
+                GLOBAL_STATE[slug] = state
+
+        except Exception as e:
+            print("[GLOBAL WATCH LOOP ERROR]", e)
+
+        time.sleep(GLOBAL_ALERT_INTERVAL_SEC)
 
 
 # =========================
@@ -1146,6 +1311,7 @@ def main() -> None:
     # Start background loops
     threading.Thread(target=alert_loop, daemon=True).start()
     threading.Thread(target=whale_alert_loop, daemon=True).start()
+    threading.Thread(target=global_watch_loop, daemon=True).start()
 
     while True:
         try:
@@ -1171,6 +1337,7 @@ def main() -> None:
             if not text:
                 continue
 
+            ACTIVE_CHATS.add(chat_id)
             lower = text.strip().lower()
 
             # /start
@@ -1183,9 +1350,10 @@ def main() -> None:
                     "- I show AI vs market %, trading signals, whales, and profit examples.\n"
                     "- After analysis, reply with an amount (e.g. `50`) for an AI bet calculator.\n"
                     "- Whale / new trade alerts run every 5 min for markets you send (use `/alerts_off` to stop).\n"
+                    "- Global edge alerts from my internal watchlist run every ~1 min (same toggle).\n"
                     "- `/watch <link> [threshold]` → edge-based alerts (optional advanced).\n"
                     "- `/watches`, `/unwatch` to manage watchlist.\n"
-                    "- `/alerts_on` / `/alerts_off` to toggle whale alerts.\n"
+                    "- `/alerts_on` / `/alerts_off` to toggle all push alerts.\n"
                     "- `/arb` → scan a small watchlist for internal arbitrage.\n\n"
                     "⚠️ This is *not* financial advice. Markets are risky."
                 )
